@@ -1,0 +1,14 @@
+requests
+openai
+elevenlabs
+ffmpeg-python
+python-dotenv
+pyperclip
+static-ffmpeg
+torch
+transformers
+scipy
+imageio
+Pillow
+opencv-python
+numpy
