@@ -77,6 +77,49 @@ NVIDIA_NIM_API_KEY = os.getenv("NVIDIA_NIM_API_KEY")
 from openai import OpenAI
 from EnvatoDownloader import EnvatoElementsDownloader, BASE_DOWNLOAD_DIR, human_delay
 
+def check_and_install_whisper():
+    try:
+        import faster_whisper
+        return True
+    except ImportError:
+        pass
+    
+    print("\n[!] faster-whisper is not installed. Checking system specs...")
+    import platform
+    print(f"   OS: {platform.system()} {platform.release()} ({platform.machine()})")
+    
+    # Check RAM if psutil is available
+    try:
+        import psutil
+        total_ram_gb = psutil.virtual_memory().total / (1024**3)
+        print(f"   Total RAM: {total_ram_gb:.1f} GB")
+        if total_ram_gb < 3.5:
+            print("   ⚠️ Warning: System has less than 4GB RAM. Whisper will be unstable. Falling back to old generation flow.")
+            return False
+    except ImportError:
+        print("   Total RAM: Unknown (psutil not installed)")
+        
+    # Check GPU if torch is available
+    try:
+        import torch
+        if torch.cuda.is_available():
+            print(f"   GPU: CUDA available ({torch.cuda.get_device_name(0)})")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            print("   GPU: Apple MPS available")
+        else:
+            print("   GPU: None detected. Whisper will run on CPU.")
+    except ImportError:
+        print("   GPU: Unknown (torch not installed)")
+
+    print("   Installing faster-whisper (this may take a minute)...")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "faster-whisper"], check=True)
+        print("   ✅ faster-whisper installed successfully!")
+        return True
+    except Exception as e:
+        print(f"   ❌ Failed to install faster-whisper: {e}")
+        return False
+
 # Initialize NIM client
 nim_client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
@@ -137,6 +180,7 @@ def get_script_and_segments():
     You are a video editor. Break the following script down into distinct visual segments.
     Each segment should correspond to 1-3 sentences.
     You must also identify ONE primary theme concept (1-3 words max) that is the absolute core subject of the video. 
+    The theme_word MUST be an exact substring of the script text.
     You must also select a vibrant Hex color code (6 characters, no #) that matches this theme.
     
     Output ONLY a JSON object with this exact structure:
@@ -178,6 +222,17 @@ def get_script_and_segments():
             theme_word = data.get("theme_word", "Concept")
             theme_hex_color = data.get("theme_hex_color", "00FFFF")
                 
+            # Deterministic Validation: Ensure theme_word is exactly in the script
+            if theme_word.lower() not in clean_script_text.lower():
+                import string
+                # Find all words > 4 chars to pick a meaningful fallback
+                valid_words = [w.strip(string.punctuation) for w in clean_script_text.split() if len(w.strip(string.punctuation)) > 4]
+                if valid_words:
+                    theme_word = max(valid_words, key=len) # Fallback to longest word
+                else:
+                    theme_word = clean_script_text.split()[0] if clean_script_text else "Concept"
+                print(f"⚠️  LLM hallucinated theme word. Falling back to exact substring: '{theme_word}'")
+                
             # Save to cache
             with open("segments.json", "w") as f:
                 json.dump({
@@ -195,17 +250,13 @@ def get_script_and_segments():
                 print(content)
                 raise e
 
-def generate_voiceover_api(segment, script_hash):
-    text = segment["voiceover_text"]
-    seg_id = segment["segment_id"]
-    audio_path = f"{script_hash}_{seg_id}_audio.mp3"
-    
+def generate_voiceover_api(text, audio_path):
     # Check if audio already exists
     if os.path.exists(audio_path):
-        print(f"   Audio already exists for {seg_id} -> {audio_path}")
+        print(f"   Audio already exists -> {audio_path}")
         return True
         
-    print(f"   Generating voiceover for {seg_id} via ElevenLabs...")
+    print(f"   Generating voiceover via ElevenLabs...")
     
     # Using a default pleasant voice: Rachel
     voice_id = "21m00Tcm4TlvDq8ikWAM" 
@@ -237,19 +288,15 @@ def generate_voiceover_api(segment, script_hash):
         print(f"   [!] ElevenLabs API failed (Error: {e})")
         return False
 
-def generate_voiceover_edge_tts(segment, script_hash, voice="en-US-GuyNeural"):
+def generate_voiceover_edge_tts(text, audio_path, voice="en-US-GuyNeural"):
     """Generate voiceover using Microsoft Edge TTS (free, no API key)."""
     import edge_tts
 
-    text = segment["voiceover_text"]
-    seg_id = segment["segment_id"]
-    audio_path = f"{script_hash}_{seg_id}_audio.mp3"
-
     if os.path.exists(audio_path):
-        print(f"   Audio already exists for {seg_id} -> {audio_path}")
+        print(f"   Audio already exists -> {audio_path}")
         return True
 
-    print(f"   Generating voiceover for {seg_id} via Edge TTS (voice: {voice})...")
+    print(f"   Generating voiceover via Edge TTS (voice: {voice})...")
     try:
         communicate = edge_tts.Communicate(text, voice)
         asyncio.run(communicate.save(audio_path))
@@ -258,6 +305,66 @@ def generate_voiceover_edge_tts(segment, script_hash, voice="en-US-GuyNeural"):
     except Exception as e:
         print(f"   [!] Edge TTS failed (Error: {e})")
         return False
+        
+def transcribe_and_align(audio_path, original_text):
+    from faster_whisper import WhisperModel
+    import string
+    
+    print("   Loading faster-whisper model (base.en)...")
+    # Determine compute_type based on platform. cpu typically only supports int8 or float32.
+    compute_type = "int8"
+    try:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda":
+            compute_type = "float16" # GPUs support float16
+    except:
+        device = "cpu"
+        
+    model = WhisperModel("base.en", device=device, compute_type=compute_type)
+    print("   Extracting word-level timestamps...")
+    transcribed_segments, _ = model.transcribe(audio_path, word_timestamps=True)
+    
+    whisper_words = []
+    for segment in transcribed_segments:
+        for word in segment.words:
+            clean_w = word.word.strip().strip(string.punctuation).lower()
+            if clean_w:
+                whisper_words.append({
+                    "word": word.word.strip(), 
+                    "clean": clean_w,
+                    "start": word.start, 
+                    "end": word.end
+                })
+                
+    # Sequence Alignment to Original Script
+    orig_words = original_text.split()
+    aligned_timestamps = []
+    
+    w_idx = 0
+    for o_word in orig_words:
+        clean_o = o_word.strip(string.punctuation).lower()
+        if not clean_o:
+            # If the original word is purely punctuation, give it a tiny duration mapped to previous word
+            prev_end = aligned_timestamps[-1]["end"] if aligned_timestamps else 0.0
+            aligned_timestamps.append({"word": o_word, "start": prev_end, "end": prev_end + 0.01})
+            continue
+            
+        match = None
+        for i in range(w_idx, min(w_idx + 8, len(whisper_words))):
+            if whisper_words[i]["clean"] == clean_o:
+                match = whisper_words[i]
+                w_idx = i + 1
+                break
+                
+        if match:
+            aligned_timestamps.append({"word": o_word, "start": match["start"], "end": match["end"]})
+        else:
+            # Interpolate if whisper missed it
+            prev_end = aligned_timestamps[-1]["end"] if aligned_timestamps else 0.0
+            aligned_timestamps.append({"word": o_word, "start": prev_end + 0.05, "end": prev_end + 0.2})
+            
+    return aligned_timestamps
 
 def get_audio_duration(audio_path):
     cmd = [
@@ -430,101 +537,101 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         cs = int(round((seconds - int(seconds)) * 100))
         return f"{hours}:{minutes:02d}:{secs:02d}.{cs:02d}"
         
-    def write_chunks(text, start, dur):
+    def write_chunks(words_data, global_offset):
         nonlocal ass_content
-        words = text.split()
-        if not words: return
+        if not words_data: return
         CHUNK_SIZE = 4
-        chunks = [" ".join(words[i:i + CHUNK_SIZE]) for i in range(0, len(words), CHUNK_SIZE)]
-        c_dur = dur / len(chunks)
-        c_start = start
-        for c in chunks:
-            c_end = c_start + c_dur
-            ass_content += f"Dialogue: 0,{format_time_ass(c_start)},{format_time_ass(c_end)},Default,,0,0,0,,{c}\n"
-            c_start = c_end
+        chunks = [words_data[i:i + CHUNK_SIZE] for i in range(0, len(words_data), CHUNK_SIZE)]
+        for chunk in chunks:
+            c_start = global_offset + chunk[0]["start"]
+            c_end = global_offset + chunk[-1]["end"]
+            text = " ".join([w["word"] for w in chunk])
+            ass_content += f"Dialogue: 0,{format_time_ass(c_start)},{format_time_ass(c_end)},Default,,0,0,0,,{text}\n"
 
     for seg, duration in segment_durations:
         start_time = current_time
         end_time = current_time + duration
         current_time = end_time
         
-        text = seg['voiceover_text'].strip()
-        
-        match = None
-        if theme_word:
-            pattern = re.compile(re.escape(theme_word), re.IGNORECASE)
-            match = pattern.search(text)
-            
-        if match:
-            before_text = text[:match.start()].strip()
-            theme_text = text[match.start():match.end()].strip()
-            
-            if theme_text:
-                theme_text = theme_text.upper()
-                
-            after_text = text[match.end():].strip()
-            
-            # Character-level interpolation for perfect timing!
-            # We give commas and periods a heavy weight to simulate the AI speaker pausing.
+        words_data = seg.get("word_timestamps", [])
+        if not words_data:
+            # Fallback to character-level timing interpolation if Whisper is unavailable
             def char_weight(s):
                 if not s: return 0
                 weight = len(s)
-                weight += s.count(',') * 8  # A comma acts like 8 characters of time
-                weight += s.count('.') * 12 # A period acts like 12 characters of time
-                weight += s.count(' ') * 2  # Spaces take a tiny bit of time
+                weight += s.count(',') * 8
+                weight += s.count('.') * 12
+                weight += s.count('?') * 12
+                weight += s.count('!') * 12
                 return weight
                 
-            w_before = char_weight(before_text)
-            w_theme = max(1, char_weight(theme_text))
-            w_after = char_weight(after_text)
-            total_w = max(1, w_before + w_theme + w_after)
+            words = seg["voiceover_text"].split()
+            total_weight = max(1, sum(char_weight(w) for w in words))
+            time_per_weight = duration / total_weight
             
-            time_per_weight = duration / total_w
-            b_dur = w_before * time_per_weight
-            t_dur = w_theme * time_per_weight
-            a_dur = duration - b_dur - t_dur
+            words_data = []
+            curr_start = 0.0
+            for w in words:
+                # Minimum weight of 1 so short words don't flash instantly
+                w_dur = max(1, char_weight(w)) * time_per_weight
+                words_data.append({"word": w, "start": curr_start, "end": curr_start + w_dur})
+                curr_start += w_dur
             
-            write_chunks(before_text, start_time, b_dur)
-            
-            t_start = start_time + b_dur
-            chars = list(theme_text)
-            
-            # Slower, more dramatic typing
-            type_speed = min(0.12, t_dur / len(chars))
-            
-            # Calculate how long the NEXT 6 words take, capped at 3 seconds max
-            a_words = after_text.split()
-            extended_dur = 0
-            if a_words:
-                words_to_keep = min(6, len(a_words))
-                extended_dur = (words_to_keep / len(a_words)) * a_dur
-                extended_dur = min(3.0, extended_dur)
+        theme_matched = False
+        if theme_word and theme_word.lower() in seg["voiceover_text"].lower():
+            # Find which word indices correspond to the theme word
+            idx = seg["voiceover_text"].lower().find(theme_word.lower())
+            if idx != -1:
+                words_before = len(seg["voiceover_text"][:idx].split())
+                theme_len = len(theme_word.split())
                 
-            final_end_time = t_start + t_dur + extended_dur
-            
-            c_start = t_start
-            for i in range(1, len(chars) + 1):
-                partial = "".join(chars[:i])
-                is_last = (i == len(chars))
+                before_words = words_data[:words_before]
+                theme_words = words_data[words_before : words_before + theme_len]
+                after_words = words_data[words_before + theme_len:]
                 
-                c_end = final_end_time if is_last else c_start + type_speed
+                write_chunks(before_words, start_time)
                 
-                # Add a subtle POP animation to the final fully typed word
-                if is_last:
-                    stylized_text = f"{{\\fscx115\\fscy115\\t(0,250,\\fscx100\\fscy100)\\blur2}}{partial}"
-                else:
-                    stylized_text = partial
+                if theme_words:
+                    t_start = start_time + theme_words[0]["start"]
+                    t_dur = max(0.1, theme_words[-1]["end"] - theme_words[0]["start"])
                     
-                ass_content += f"Dialogue: 0,{format_time_ass(c_start)},{format_time_ass(c_end)},Highlight,,0,0,0,,{stylized_text}\n"
-                c_start = c_end
-                
-            write_chunks(after_text, t_start + t_dur, a_dur)
-            
-            theme_start = t_start
-            theme_end = final_end_time
-            theme_word = None
-        else:
-            write_chunks(text, start_time, duration)
+                    theme_text = " ".join([w["word"] for w in theme_words]).upper()
+                    chars = list(theme_text)
+                    type_speed = min(0.12, t_dur / max(1, len(chars)))
+                    
+                    # Calculate extended duration for the pop animation to linger
+                    a_dur = max(0.1, after_words[-1]["end"] - after_words[0]["start"]) if after_words else 0
+                    extended_dur = 0
+                    if after_words:
+                        words_to_keep = min(6, len(after_words))
+                        extended_dur = (words_to_keep / len(after_words)) * a_dur
+                        extended_dur = min(3.0, extended_dur)
+                        
+                    final_end_time = t_start + t_dur + extended_dur
+                    
+                    c_start = t_start
+                    for i in range(1, len(chars) + 1):
+                        partial = "".join(chars[:i])
+                        is_last = (i == len(chars))
+                        c_end = final_end_time if is_last else c_start + type_speed
+                        
+                        if is_last:
+                            stylized_text = f"{{\\fscx115\\fscy115\\t(0,250,\\fscx100\\fscy100)\\blur2}}{partial}"
+                        else:
+                            stylized_text = partial
+                            
+                        ass_content += f"Dialogue: 0,{format_time_ass(c_start)},{format_time_ass(c_end)},Highlight,,0,0,0,,{stylized_text}\n"
+                        c_start = c_end
+                        
+                    write_chunks(after_words, start_time)
+                    
+                    theme_start = t_start
+                    theme_end = final_end_time
+                    theme_word = None
+                    theme_matched = True
+        
+        if not theme_matched:
+            write_chunks(words_data, start_time)
         
     ass_path = f"subtitles_{script_hash}.ass"
     with open(ass_path, "w") as f:
@@ -616,6 +723,11 @@ def main():
     if not NVIDIA_NIM_API_KEY:
         print("Please set NVIDIA_NIM_API_KEY in the .env file. It is required for script generation.")
         return
+
+    # Check and install Whisper for timestamp generation
+    whisper_available = check_and_install_whisper()
+    if not whisper_available:
+        print("⚠️ Whisper is unavailable. System will use legacy fallback generation (segment-by-segment).")
 
     elevenlabs_available = bool(ELEVENLABS_API_KEY and ELEVENLABS_API_KEY.strip())
     if not elevenlabs_available:
@@ -841,161 +953,134 @@ def main():
     # PHASE 2: GENERATE ALL AUDIO
     # ---------------------------------------------------------
     print("\n=== PHASE 2: AUDIO GENERATION ===")
-    fallback_needed = not elevenlabs_available
-    missing_audio_segments = []
-
-    if fallback_needed:
-        print("Skipping ElevenLabs API (no key configured).")
+    
+    if whisper_available:
+        full_audio_path = f"full_audio_{script_hash}.mp3"
+        full_text = " ".join([seg["voiceover_text"] for seg in segments])
+        
+        audio_ready = False
+        if elevenlabs_available:
+            audio_ready = generate_voiceover_api(full_text, full_audio_path)
+        
+        if not audio_ready:
+            print("\n[!] ElevenLabs unavailable or failed. Switching to fallback.")
+            print("\n" + "="*60)
+            print(" FALLBACK — CHOOSE TTS METHOD")
+            print("="*60)
+            
+            clipboard_works = clipboard_copy("test")
+            if clipboard_works:
+                print("  [1] 📋 Manual Voiceover (Full script copied to your clipboard)")
+            else:
+                print("  [1] 📋 Manual Voiceover (Full script printed to terminal)")
+            print("  [2] 🤖 Auto-generate with Edge TTS (free, no API key)")
+            choice = input("\nSelect option (1 or 2): ").strip()
+            
+            if choice == "2":
+                print("\n🤖 Using Edge TTS...")
+                audio_ready = generate_voiceover_edge_tts(full_text, full_audio_path)
+                
+            if not audio_ready:
+                print("\n[!] Please generate manual audio for the full script.")
+                print(f"\n   ── TEXT START ──\n   {full_text}\n   ── TEXT END ──\n")
+                
+                if clipboard_works:
+                    clipboard_copy(full_text)
+                    print("📋 Full script copied to clipboard!")
+                    
+                input(f"   → Generate TTS manually, save it precisely as '{full_audio_path}' in the current folder, and press Enter...")
+            
+        aligned_words = transcribe_and_align(full_audio_path, full_text)
+        
+        import string
+        print("\n=== Splitting Full Audio into Segments ===")
+        word_ptr = 0
         for seg in segments:
             seg_id = seg["segment_id"]
-            if not os.path.exists(f"{script_hash}_{seg_id}_audio.mp3"):
-                missing_audio_segments.append(seg)
+            seg_text = seg["voiceover_text"]
+            
+            seg_word_count = len([w for w in seg_text.split() if w.strip(string.punctuation).lower()])
+            seg_words = aligned_words[word_ptr : word_ptr + seg_word_count]
+            word_ptr += seg_word_count
+            
+            if seg_words:
+                start_time = seg_words[0]["start"]
+                end_time = seg_words[-1]["end"]
+            else:
+                start_time, end_time = 0.0, 1.0
+                
+            end_time += 0.3
+            
+            seg_audio = f"{script_hash}_{seg_id}_audio.mp3"
+            if not os.path.exists(seg_audio):
+                print(f"   Extracting audio for {seg_id} ({start_time:.2f}s - {end_time:.2f}s)...")
+                cmd = ["ffmpeg", "-y", "-i", full_audio_path, "-ss", str(start_time), "-to", str(end_time), "-c", "copy", seg_audio]
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+            seg["word_timestamps"] = []
+            for w in seg_words:
+                seg["word_timestamps"].append({
+                    "word": w["word"],
+                    "start": max(0.0, w["start"] - start_time),
+                    "end": max(0.0, w["end"] - start_time)
+                })
     else:
-        for seg in segments:
-            success = generate_voiceover_api(seg, script_hash)
-            if not success:
-                print("\n[!] ElevenLabs API call failed. Switching to fallback.")
-                fallback_needed = True
-                # Collect this and all remaining segments that still need audio
+        print("Using legacy segment-by-segment generation (whisper unavailable).")
+        fallback_needed = not elevenlabs_available
+        missing_audio_segments = []
+
+        if fallback_needed:
+            for seg in segments:
                 seg_id = seg["segment_id"]
                 if not os.path.exists(f"{script_hash}_{seg_id}_audio.mp3"):
                     missing_audio_segments.append(seg)
-                # Collect remaining segments
-                remaining_idx = segments.index(seg) + 1
-                for remaining_seg in segments[remaining_idx:]:
-                    rsid = remaining_seg["segment_id"]
-                    if not os.path.exists(f"{script_hash}_{rsid}_audio.mp3"):
-                        missing_audio_segments.append(remaining_seg)
-                break
-
-    if fallback_needed and missing_audio_segments:
-        # ── Step 1: Try clipboard copy ──
-        clipboard_works = clipboard_copy("test")
-
-        if clipboard_works:
-            # Clipboard is available — offer clipboard-assisted manual flow
+        else:
+            for seg in segments:
+                seg_id = seg["segment_id"]
+                audio_path = f"{script_hash}_{seg_id}_audio.mp3"
+                if not generate_voiceover_api(seg["voiceover_text"], audio_path):
+                    print("\n[!] ElevenLabs API call failed. Switching to fallback.")
+                    fallback_needed = True
+                    if not os.path.exists(audio_path):
+                        missing_audio_segments.append(seg)
+                    for r_seg in segments[segments.index(seg)+1:]:
+                        if not os.path.exists(f"{script_hash}_{r_seg['segment_id']}_audio.mp3"):
+                            missing_audio_segments.append(r_seg)
+                    break
+                    
+        if fallback_needed and missing_audio_segments:
             print("\n" + "="*60)
             print(" FALLBACK — CHOOSE TTS METHOD")
             print("="*60)
-            print(f"{len(missing_audio_segments)} segment(s) need voiceover.\n")
-            print("  [1] 📋 Manual Voiceover (Script automatically copies text to your clipboard)")
-            print("  [2] 🤖 Auto-generate with Edge TTS (free, no API key, instant)")
+            print("  [1] 📋 Manual Voiceover (Segment by Segment)")
+            print("  [2] 🤖 Auto-generate with Edge TTS (free, no API key)")
             choice = input("\nSelect option (1 or 2): ").strip()
-        else:
-            # No clipboard — offer terminal-based manual or edge-tts
-            print("\n" + "="*60)
-            print(" FALLBACK — CHOOSE TTS METHOD")
-            print("="*60)
-            print(f"{len(missing_audio_segments)} segment(s) need voiceover.")
-            print("(Clipboard unavailable on this system)\n")
-            print("  [1] 📋 Manual Voiceover (Text printed to terminal for you to copy)")
-            print("  [2] 🤖 Auto-generate with Edge TTS (free, no API key, instant)")
-            choice = input("\nSelect option (1 or 2): ").strip()
-
-        if choice == "2":
-            # ── Edge TTS auto-generation ──
-            print("\n🤖 Using Edge TTS for automatic voiceover generation...")
-            for idx, seg in enumerate(missing_audio_segments, 1):
-                print(f"   [{idx}/{len(missing_audio_segments)}]", end=" ")
-                generate_voiceover_edge_tts(seg, script_hash)
-            print("\n✅ Edge TTS generation complete!")
-        else:
-            # ── Manual mode (clipboard or terminal) ──
-            print("\n" + "="*60)
-            print(" MANUAL AUDIO MODE")
-            print("="*60)
-            print(f"There are {len(missing_audio_segments)} segments that need manual voiceover.")
-            if clipboard_works:
-                print("Each segment's text will be copied to your clipboard.")
+            
+            if choice == "2":
+                print("\n🤖 Using Edge TTS...")
+                for seg in missing_audio_segments:
+                    generate_voiceover_edge_tts(seg["voiceover_text"], f"{script_hash}_{seg['segment_id']}_audio.mp3")
             else:
-                print("Each segment's text will be printed below.")
-            print("Generate the MP3 using any TTS service, download it, then press Enter.\n")
-
-            manual_dir = os.path.abspath("manual_audio")
-            os.makedirs(manual_dir, exist_ok=True)
-
-            existing_manual = [f for f in os.listdir(manual_dir) if f.lower().endswith('.mp3')]
-            skip_prompts = False
-
-            if existing_manual:
-                resp = input(f"\n[!] Found {len(existing_manual)} MP3(s) already in 'manual_audio/'. "
-                             f"Skip text copying and map these files directly? (Y/n): ")
-                if resp.strip().lower() != 'n':
-                    skip_prompts = True
-
-            if not skip_prompts:
+                manual_dir = os.path.abspath("manual_audio")
+                os.makedirs(manual_dir, exist_ok=True)
                 for idx, seg in enumerate(missing_audio_segments, 1):
                     text = seg["voiceover_text"]
-                    if clipboard_works:
-                        clipboard_copy(text)
-                        print(f"\n📋 [{idx}/{len(missing_audio_segments)}] Segment '{seg['segment_id']}' — copied to clipboard:")
-                    else:
-                        print(f"\n📋 [{idx}/{len(missing_audio_segments)}] Segment '{seg['segment_id']}' — copy the text below:")
-
-                    print(f"\n   ── TEXT START ──")
-                    print(f"   {text}")
-                    print(f"   ── TEXT END ──\n")
+                    clipboard_copy(text)
+                    print(f"\n📋 [{idx}/{len(missing_audio_segments)}] Segment '{seg['segment_id']}' copied to clipboard:")
+                    print(f"   ── TEXT START ──\n   {text}\n   ── TEXT END ──")
                     input("   → Press Enter when you've generated & downloaded this segment's audio... ")
-                    print("   ✓ Done.")
-
-                print(f"\n✅ All {len(missing_audio_segments)} texts provided!")
-
-            # --- Auto-move MP3s from ~/Downloads into manual_audio/ ---
-            downloads_dir = Path.home() / "Downloads"
-            if downloads_dir.exists():
-                dl_mp3s = sorted(
-                    [f for f in downloads_dir.iterdir() if f.suffix.lower() == '.mp3'],
-                    key=lambda f: f.stat().st_mtime
-                )
+                    
+                import shutil
+                dl_mp3s = sorted([f for f in Path.home().joinpath("Downloads").iterdir() if f.suffix.lower() == '.mp3' and f.stat().st_mtime >= time.time() - 1800], key=lambda f: f.stat().st_mtime)
                 if dl_mp3s:
-                    # Only consider files created/modified during this session
-                    # (within the last 30 minutes, or all if skip_prompts)
-                    import shutil as _shutil
-                    recent_cutoff = time.time() - 1800  # 30 minutes
-                    recent_mp3s = [f for f in dl_mp3s if f.stat().st_mtime >= recent_cutoff]
-
-                    if recent_mp3s:
-                        print(f"\n🔍 Found {len(recent_mp3s)} recent MP3(s) in ~/Downloads.")
-                        resp = input(f"   Move them to 'manual_audio/' for mapping? (Y/n): ")
-                        if resp.strip().lower() != 'n':
-                            for f in recent_mp3s:
-                                dest = Path(manual_dir) / f.name
-                                _shutil.move(str(f), str(dest))
-                                print(f"   Moved: {f.name}")
-
-            # Open the folder for the user
-            print(f"\nManual audio folder: {manual_dir}")
-            if sys.platform == "darwin":
-                subprocess.run(["open", manual_dir])
-            elif sys.platform == "win32":
-                subprocess.run(["start", manual_dir], shell=True)
-            elif sys.platform.startswith("linux"):
-                subprocess.run(["xdg-open", manual_dir])
-
-            while True:
-                resp = input("\nAll files in 'manual_audio/'? Type 'Y' to continue: ")
-                if resp.strip().upper() == 'Y':
-                    mp3_files = [f for f in os.listdir(manual_dir) if f.lower().endswith('.mp3')]
-                    if len(mp3_files) < len(missing_audio_segments):
-                        print(f"⚠️  Found {len(mp3_files)} files, but expected {len(missing_audio_segments)}.")
-                        retry = input("Continue anyway? (y/n): ")
-                        if retry.lower() != 'y':
-                            continue
-                    break
-
-            # Sort files by creation time (ascending) — first segment = oldest file
-            mp3_files.sort(key=lambda x: os.path.getmtime(os.path.join(manual_dir, x)))
-
-            print("\nMapping files to segments (oldest → first segment):")
-            for i, file_name in enumerate(mp3_files):
-                if i < len(missing_audio_segments):
-                    seg_id = missing_audio_segments[i]["segment_id"]
-                    src = os.path.join(manual_dir, file_name)
-                    dst = f"{script_hash}_{seg_id}_audio.mp3"
-                    os.rename(src, dst)
-                    print(f"   {file_name} → {dst}")
-
-            print("✅ Manual audio mapping complete!")
+                    if input(f"\nMove {len(dl_mp3s)} recent MP3(s) from ~/Downloads to 'manual_audio/'? (Y/n): ").strip().lower() != 'n':
+                        for f in dl_mp3s: shutil.move(str(f), str(Path(manual_dir) / f.name))
+                        
+                mp3_files = sorted([f for f in os.listdir(manual_dir) if f.lower().endswith('.mp3')], key=lambda x: os.path.getmtime(os.path.join(manual_dir, x)))
+                for i, file_name in enumerate(mp3_files):
+                    if i < len(missing_audio_segments):
+                        os.rename(os.path.join(manual_dir, file_name), f"{script_hash}_{missing_audio_segments[i]['segment_id']}_audio.mp3")
+                print("✅ Manual audio mapping complete!")
 
     # Verify all audio is present before proceeding
     segments = [s for s in segments if os.path.exists(f"{script_hash}_{s['segment_id']}_audio.mp3")]
