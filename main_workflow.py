@@ -5,12 +5,65 @@ import time
 import hashlib
 import zipfile
 import subprocess
+import asyncio
 import requests
-import pyperclip
 import static_ffmpeg
 import re
 from pathlib import Path
 from dotenv import load_dotenv
+
+def clipboard_copy(text: str) -> bool:
+    """
+    Attempts to copy text to the clipboard using a chain of fallbacks:
+    1. copykitten (Rust-backed, no external system dependencies like xclip)
+    2. pyperclip (uses xclip/xsel/pbcopy/pbpaste or python GUI frameworks)
+    3. platform-specific shell tools via subprocess (pbcopy, clip, xclip, xsel, wl-copy)
+    
+    Returns True if successfully copied, False otherwise.
+    """
+    # ── Try copykitten ──
+    try:
+        import copykitten
+        # Use detach=True so the clipboard content persists after the python process exits (only relevant on Linux).
+        copykitten.copy(text, detach=True)
+        return True
+    except Exception as e:
+        print(f"[DEBUG] copykitten failed: {e}")
+        pass
+
+    # ── Try pyperclip ──
+    try:
+        import pyperclip
+        pyperclip.copy(text)
+        return True
+    except Exception as e:
+        print(f"[DEBUG] pyperclip failed: {e}")
+        pass
+
+    # ── Try native subprocess shell utilities ──
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text.encode('utf-8'), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        elif sys.platform == "win32":
+            subprocess.run(["clip"], input=text.encode('utf-8'), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        elif sys.platform.startswith("linux"):
+            for cmd in [
+                ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"],
+                ["wl-copy"]
+            ]:
+                try:
+                    subprocess.run(cmd, input=text.encode('utf-8'), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return True
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    continue
+    except Exception as e:
+        print(f"[DEBUG] subprocess failed: {e}")
+        pass
+
+    return False
 
 # Load environment variables
 load_dotenv()
@@ -184,6 +237,28 @@ def generate_voiceover_api(segment, script_hash):
         print(f"   [!] ElevenLabs API failed (Error: {e})")
         return False
 
+def generate_voiceover_edge_tts(segment, script_hash, voice="en-US-GuyNeural"):
+    """Generate voiceover using Microsoft Edge TTS (free, no API key)."""
+    import edge_tts
+
+    text = segment["voiceover_text"]
+    seg_id = segment["segment_id"]
+    audio_path = f"{script_hash}_{seg_id}_audio.mp3"
+
+    if os.path.exists(audio_path):
+        print(f"   Audio already exists for {seg_id} -> {audio_path}")
+        return True
+
+    print(f"   Generating voiceover for {seg_id} via Edge TTS (voice: {voice})...")
+    try:
+        communicate = edge_tts.Communicate(text, voice)
+        asyncio.run(communicate.save(audio_path))
+        print(f"   ✓ Saved {audio_path}")
+        return True
+    except Exception as e:
+        print(f"   [!] Edge TTS failed (Error: {e})")
+        return False
+
 def get_audio_duration(audio_path):
     cmd = [
         "ffprobe", "-v", "error", 
@@ -213,12 +288,13 @@ def process_segment_video(segment, video_path, audio_path, duration, script_hash
     
     cmd = [
         "ffmpeg", "-y",
+        "-stream_loop", "-1",
         "-i", video_path,
         "-i", audio_path,
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-t", str(duration),
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,format=yuv420p",
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,setsar=1,format=yuv420p",
         "-c:v", "libx264",
         "-af", af_filter,
         "-c:a", "aac",
@@ -229,23 +305,95 @@ def process_segment_video(segment, video_path, audio_path, duration, script_hash
     return output_path
 
 def stitch_videos(video_paths, script_hash):
-    print("Step 5: Stitching segments together...")
+    print("Step 5: Stitching segments together (with crossfade transitions)...")
     output_path = f"merged_output_{script_hash}.mp4"
-    concat_txt = f"concat_{script_hash}.txt"
     
-    with open(concat_txt, "w") as f:
-        for vp in video_paths:
-            f.write(f"file '{vp}'\n")
-            
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concat_txt,
-        "-c", "copy",
+    CROSSFADE_DURATION = 0.3  # seconds of overlap between segments
+
+    if len(video_paths) == 1:
+        # Single segment — just copy it
+        import shutil as _shutil
+        _shutil.copy2(video_paths[0], output_path)
+        return output_path
+
+    # Build xfade filter chain for smooth transitions between segments
+    # Each xfade needs the offset = (cumulative duration so far) - (crossfade * transition_index)
+    # We need durations of each segment to compute offsets.
+    durations = []
+    for vp in video_paths:
+        dur = float(subprocess.check_output([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            vp
+        ]).decode().strip())
+        durations.append(dur)
+
+    # Build the filter_complex for N-1 crossfades
+    n = len(video_paths)
+    filter_parts = []
+    cumulative_dur = durations[0]
+
+    for i in range(n - 1):
+        offset = cumulative_dur - CROSSFADE_DURATION
+        offset = max(0, offset)  # safety clamp
+
+        if i == 0:
+            src_a = "[0:v]"
+        else:
+            src_a = f"[xf{i-1}]"
+
+        src_b = f"[{i+1}:v]"
+
+        if i < n - 2:
+            out_label = f"[xf{i}]"
+        else:
+            out_label = "[vout]"
+
+        filter_parts.append(
+            f"{src_a}{src_b}xfade=transition=fade:duration={CROSSFADE_DURATION}:offset={offset:.3f}{out_label}"
+        )
+
+        cumulative_dur = offset + durations[i + 1]
+
+    # Audio: concat all audio streams
+    audio_inputs = "".join(f"[{i}:a]" for i in range(n))
+    filter_parts.append(f"{audio_inputs}concat=n={n}:v=0:a=1[aout]")
+
+    filter_complex = ";\n".join(filter_parts)
+
+    cmd = ["ffmpeg", "-y"]
+    for vp in video_paths:
+        cmd.extend(["-i", vp])
+    cmd.extend([
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-movflags", "+faststart",
         output_path
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ])
+
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        # Fallback to simple concat if xfade fails (e.g. mismatched formats)
+        print("   ⚠️  Crossfade failed, falling back to simple concat...")
+        concat_txt = f"concat_{script_hash}.txt"
+        with open(concat_txt, "w") as f:
+            for vp in video_paths:
+                f.write(f"file '{vp}'\n")
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_txt,
+            "-c", "copy",
+            output_path
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     return output_path
 
 import re
@@ -465,9 +613,13 @@ def generate_and_burn_subtitles(video_path, theme_word, theme_hex_color, theme_s
         os.rename(video_path, output_path)
 
 def main():
-    if not ELEVENLABS_API_KEY or not NVIDIA_NIM_API_KEY:
-        print("Please set ELEVENLABS_API_KEY and NVIDIA_NIM_API_KEY in the .env file.")
+    if not NVIDIA_NIM_API_KEY:
+        print("Please set NVIDIA_NIM_API_KEY in the .env file. It is required for script generation.")
         return
+
+    elevenlabs_available = bool(ELEVENLABS_API_KEY and ELEVENLABS_API_KEY.strip())
+    if not elevenlabs_available:
+        print("⚠️  ELEVENLABS_API_KEY is empty — will use fallback TTS for voiceovers.")
         
     segments_data = get_script_and_segments()
     if not segments_data: return
@@ -689,80 +841,161 @@ def main():
     # PHASE 2: GENERATE ALL AUDIO
     # ---------------------------------------------------------
     print("\n=== PHASE 2: AUDIO GENERATION ===")
-    manual_audio_mode = False
+    fallback_needed = not elevenlabs_available
     missing_audio_segments = []
-    
-    for seg in segments:
-        if not manual_audio_mode:
-            success = generate_voiceover_api(seg, script_hash)
-            if not success:
-                print("\n[!] Switching to Manual Audio Mode.")
-                manual_audio_mode = True
-                
-        if manual_audio_mode:
+
+    if fallback_needed:
+        print("Skipping ElevenLabs API (no key configured).")
+        for seg in segments:
             seg_id = seg["segment_id"]
             if not os.path.exists(f"{script_hash}_{seg_id}_audio.mp3"):
                 missing_audio_segments.append(seg)
+    else:
+        for seg in segments:
+            success = generate_voiceover_api(seg, script_hash)
+            if not success:
+                print("\n[!] ElevenLabs API call failed. Switching to fallback.")
+                fallback_needed = True
+                # Collect this and all remaining segments that still need audio
+                seg_id = seg["segment_id"]
+                if not os.path.exists(f"{script_hash}_{seg_id}_audio.mp3"):
+                    missing_audio_segments.append(seg)
+                # Collect remaining segments
+                remaining_idx = segments.index(seg) + 1
+                for remaining_seg in segments[remaining_idx:]:
+                    rsid = remaining_seg["segment_id"]
+                    if not os.path.exists(f"{script_hash}_{rsid}_audio.mp3"):
+                        missing_audio_segments.append(remaining_seg)
+                break
 
-    if manual_audio_mode and missing_audio_segments:
-        print("\n" + "="*60)
-        print(" MANUAL AUDIO BATCHING MODE")
-        print("="*60)
-        print(f"There are {len(missing_audio_segments)} segments that need manual voiceover.\n")
-        
-        manual_dir = os.path.abspath("manual_audio")
-        if not os.path.exists(manual_dir):
-            os.makedirs(manual_dir)
-            
-        existing_manual = [f for f in os.listdir(manual_dir) if f.endswith('.mp3')]
-        skip_prompts = False
-        
-        if existing_manual:
-            resp = input(f"\n[!] Found {len(existing_manual)} files already in 'manual_audio/'. Skip text copying and map these files directly? (Y/n): ")
-            if resp.strip().lower() != 'n':
-                skip_prompts = True
-                
-        if not skip_prompts:
-            for seg in missing_audio_segments:
-                text = seg["voiceover_text"]
-                pyperclip.copy(text)
-                print(f"[{seg['segment_id']}] Text copied to clipboard:")
-                print(f"\"{text}\"")
-                input("-> Press Enter once you've generated this (or to copy the next one)... ")
-                print("-" * 40)
-                
-            print(f"\nAll texts provided! Please place the downloaded MP3 files into this folder:")
-            print(f"{manual_dir}")
-            print("\nOpening folder for you...")
-            
+    if fallback_needed and missing_audio_segments:
+        # ── Step 1: Try clipboard copy ──
+        clipboard_works = clipboard_copy("test")
+
+        if clipboard_works:
+            # Clipboard is available — offer clipboard-assisted manual flow
+            print("\n" + "="*60)
+            print(" FALLBACK — CHOOSE TTS METHOD")
+            print("="*60)
+            print(f"{len(missing_audio_segments)} segment(s) need voiceover.\n")
+            print("  [1] 📋 Manual Voiceover (Script automatically copies text to your clipboard)")
+            print("  [2] 🤖 Auto-generate with Edge TTS (free, no API key, instant)")
+            choice = input("\nSelect option (1 or 2): ").strip()
+        else:
+            # No clipboard — offer terminal-based manual or edge-tts
+            print("\n" + "="*60)
+            print(" FALLBACK — CHOOSE TTS METHOD")
+            print("="*60)
+            print(f"{len(missing_audio_segments)} segment(s) need voiceover.")
+            print("(Clipboard unavailable on this system)\n")
+            print("  [1] 📋 Manual Voiceover (Text printed to terminal for you to copy)")
+            print("  [2] 🤖 Auto-generate with Edge TTS (free, no API key, instant)")
+            choice = input("\nSelect option (1 or 2): ").strip()
+
+        if choice == "2":
+            # ── Edge TTS auto-generation ──
+            print("\n🤖 Using Edge TTS for automatic voiceover generation...")
+            for idx, seg in enumerate(missing_audio_segments, 1):
+                print(f"   [{idx}/{len(missing_audio_segments)}]", end=" ")
+                generate_voiceover_edge_tts(seg, script_hash)
+            print("\n✅ Edge TTS generation complete!")
+        else:
+            # ── Manual mode (clipboard or terminal) ──
+            print("\n" + "="*60)
+            print(" MANUAL AUDIO MODE")
+            print("="*60)
+            print(f"There are {len(missing_audio_segments)} segments that need manual voiceover.")
+            if clipboard_works:
+                print("Each segment's text will be copied to your clipboard.")
+            else:
+                print("Each segment's text will be printed below.")
+            print("Generate the MP3 using any TTS service, download it, then press Enter.\n")
+
+            manual_dir = os.path.abspath("manual_audio")
+            os.makedirs(manual_dir, exist_ok=True)
+
+            existing_manual = [f for f in os.listdir(manual_dir) if f.lower().endswith('.mp3')]
+            skip_prompts = False
+
+            if existing_manual:
+                resp = input(f"\n[!] Found {len(existing_manual)} MP3(s) already in 'manual_audio/'. "
+                             f"Skip text copying and map these files directly? (Y/n): ")
+                if resp.strip().lower() != 'n':
+                    skip_prompts = True
+
+            if not skip_prompts:
+                for idx, seg in enumerate(missing_audio_segments, 1):
+                    text = seg["voiceover_text"]
+                    if clipboard_works:
+                        clipboard_copy(text)
+                        print(f"\n📋 [{idx}/{len(missing_audio_segments)}] Segment '{seg['segment_id']}' — copied to clipboard:")
+                    else:
+                        print(f"\n📋 [{idx}/{len(missing_audio_segments)}] Segment '{seg['segment_id']}' — copy the text below:")
+
+                    print(f"\n   ── TEXT START ──")
+                    print(f"   {text}")
+                    print(f"   ── TEXT END ──\n")
+                    input("   → Press Enter when you've generated & downloaded this segment's audio... ")
+                    print("   ✓ Done.")
+
+                print(f"\n✅ All {len(missing_audio_segments)} texts provided!")
+
+            # --- Auto-move MP3s from ~/Downloads into manual_audio/ ---
+            downloads_dir = Path.home() / "Downloads"
+            if downloads_dir.exists():
+                dl_mp3s = sorted(
+                    [f for f in downloads_dir.iterdir() if f.suffix.lower() == '.mp3'],
+                    key=lambda f: f.stat().st_mtime
+                )
+                if dl_mp3s:
+                    # Only consider files created/modified during this session
+                    # (within the last 30 minutes, or all if skip_prompts)
+                    import shutil as _shutil
+                    recent_cutoff = time.time() - 1800  # 30 minutes
+                    recent_mp3s = [f for f in dl_mp3s if f.stat().st_mtime >= recent_cutoff]
+
+                    if recent_mp3s:
+                        print(f"\n🔍 Found {len(recent_mp3s)} recent MP3(s) in ~/Downloads.")
+                        resp = input(f"   Move them to 'manual_audio/' for mapping? (Y/n): ")
+                        if resp.strip().lower() != 'n':
+                            for f in recent_mp3s:
+                                dest = Path(manual_dir) / f.name
+                                _shutil.move(str(f), str(dest))
+                                print(f"   Moved: {f.name}")
+
+            # Open the folder for the user
+            print(f"\nManual audio folder: {manual_dir}")
             if sys.platform == "darwin":
                 subprocess.run(["open", manual_dir])
             elif sys.platform == "win32":
                 subprocess.run(["start", manual_dir], shell=True)
-            
-        while True:
-            resp = input("\nHave you placed all files in the manual_audio folder? Type 'Y' to continue: ")
-            if resp.strip().upper() == 'Y':
-                mp3_files = [f for f in os.listdir(manual_dir) if f.endswith('.mp3')]
-                if len(mp3_files) < len(missing_audio_segments):
-                    print(f"Warning: Found {len(mp3_files)} files, but expected {len(missing_audio_segments)}.")
-                    retry = input("Continue anyway? (y/n): ")
-                    if retry.lower() != 'y':
-                        continue
-                break
-                
-        # Sort files by creation/modification time (ascending) to guarantee chronological mapping
-        mp3_files.sort(key=lambda x: os.path.getmtime(os.path.join(manual_dir, x)))
-        
-        for i, file_name in enumerate(mp3_files):
-            if i < len(missing_audio_segments):
-                seg_id = missing_audio_segments[i]["segment_id"]
-                src = os.path.join(manual_dir, file_name)
-                dst = f"{script_hash}_{seg_id}_audio.mp3"
-                os.rename(src, dst)
-                print(f"Mapped {file_name} -> {dst}")
-                
-        print("Manual audio mapping complete!")
+            elif sys.platform.startswith("linux"):
+                subprocess.run(["xdg-open", manual_dir])
+
+            while True:
+                resp = input("\nAll files in 'manual_audio/'? Type 'Y' to continue: ")
+                if resp.strip().upper() == 'Y':
+                    mp3_files = [f for f in os.listdir(manual_dir) if f.lower().endswith('.mp3')]
+                    if len(mp3_files) < len(missing_audio_segments):
+                        print(f"⚠️  Found {len(mp3_files)} files, but expected {len(missing_audio_segments)}.")
+                        retry = input("Continue anyway? (y/n): ")
+                        if retry.lower() != 'y':
+                            continue
+                    break
+
+            # Sort files by creation time (ascending) — first segment = oldest file
+            mp3_files.sort(key=lambda x: os.path.getmtime(os.path.join(manual_dir, x)))
+
+            print("\nMapping files to segments (oldest → first segment):")
+            for i, file_name in enumerate(mp3_files):
+                if i < len(missing_audio_segments):
+                    seg_id = missing_audio_segments[i]["segment_id"]
+                    src = os.path.join(manual_dir, file_name)
+                    dst = f"{script_hash}_{seg_id}_audio.mp3"
+                    os.rename(src, dst)
+                    print(f"   {file_name} → {dst}")
+
+            print("✅ Manual audio mapping complete!")
 
     # Verify all audio is present before proceeding
     segments = [s for s in segments if os.path.exists(f"{script_hash}_{s['segment_id']}_audio.mp3")]

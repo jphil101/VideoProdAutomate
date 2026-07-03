@@ -158,8 +158,9 @@ def generate_subtheme_videos(
             to_generate.append((img_path, output_path))
 
     if to_generate:
-        python_exec = "/Users/jerilphilip/Documents/GitProjects/ImgToMotionTest/venv/bin/python"
-        script_path = "/Users/jerilphilip/Documents/GitProjects/ImgToMotionTest/generate_parallax.py"
+        current_dir = Path(__file__).resolve().parent
+        python_exec = str(current_dir / "venv" / "bin" / "python")
+        script_path = str(current_dir.parent / "ImgToMotionTest" / "generate_parallax.py")
         
         if not os.path.exists(python_exec) or not os.path.exists(script_path):
             print(f"   [!] Cannot find ImgToMotionTest environment at {python_exec}. Skipping parallax generation.")
@@ -433,10 +434,11 @@ def build_interleaved_segment(
             cmd = [
                 "ffmpeg", "-y",
                 "-ss", f"{clip.main_video_offset:.3f}",
+                "-stream_loop", "-1",
                 "-i", main_video_path,
                 "-t", f"{clip_duration:.3f}",
                 "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,"
-                       "crop=1080:1920,fps=30,format=yuv420p",
+                       "crop=1080:1920,fps=30,setsar=1,format=yuv420p",
                 "-c:v", "libx264",
                 "-preset", "fast",
                 "-an",
@@ -446,10 +448,11 @@ def build_interleaved_segment(
             # Sub-theme parallax video — re-encode to ensure uniform params
             cmd = [
                 "ffmpeg", "-y",
+                "-stream_loop", "-1",
                 "-i", clip.video_path,
                 "-t", f"{clip_duration:.3f}",
                 "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,"
-                       "crop=1080:1920,fps=30,format=yuv420p",
+                       "crop=1080:1920,fps=30,setsar=1,format=yuv420p",
                 "-c:v", "libx264",
                 "-preset", "fast",
                 "-an",

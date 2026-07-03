@@ -4,6 +4,8 @@ elevenlabs
 ffmpeg-python
 python-dotenv
 pyperclip
+copykitten
+edge-tts
 static-ffmpeg
 torch
 transformers

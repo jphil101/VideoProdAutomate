@@ -13,3 +13,6 @@ theme_images_*/
 *.json
 old_generated/
 .envato_session/
+venv/
+concat_*.txt
+segments.json
