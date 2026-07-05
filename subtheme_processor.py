@@ -158,12 +158,17 @@ def generate_subtheme_videos(
             to_generate.append((img_path, output_path))
 
     if to_generate:
+        import sys
         current_dir = Path(__file__).resolve().parent
-        python_exec = str(current_dir / "venv" / "bin" / "python")
-        script_path = str(current_dir.parent / "ImgToMotionTest" / "generate_parallax.py")
+        parallax_repo_dir = current_dir.parent / "ImgToMotionTest"
         
-        if not os.path.exists(python_exec) or not os.path.exists(script_path):
-            print(f"   [!] Cannot find ImgToMotionTest environment at {python_exec}. Skipping parallax generation.")
+        # Use the host Python environment so it automatically inherits the 
+        # cross-platform pendrive_libs from the parent run_portable.sh script
+        python_exec = sys.executable
+        script_path = str(parallax_repo_dir / "generate_parallax.py")
+        
+        if not os.path.exists(script_path):
+            print(f"   [!] Cannot find ImgToMotionTest script at {script_path}. Skipping parallax generation.")
             return video_map
 
         for img_path, output_path in to_generate:
@@ -399,7 +404,7 @@ def _plan_multiple_insertions(
 def build_interleaved_segment(
     clips: List[Clip],
     main_video_path: str,
-    audio_path: str,
+    audio_path: Optional[str],
     duration: float,
     seg_id: str,
     script_hash: str,
@@ -433,9 +438,9 @@ def build_interleaved_segment(
             # Trim & normalize the Envato source video
             cmd = [
                 "ffmpeg", "-y",
-                "-ss", f"{clip.main_video_offset:.3f}",
                 "-stream_loop", "-1",
                 "-i", main_video_path,
+                "-ss", f"{clip.main_video_offset:.3f}",
                 "-t", f"{clip_duration:.3f}",
                 "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,"
                        "crop=1080:1920,fps=30,setsar=1,format=yuv420p",
@@ -483,24 +488,35 @@ def build_interleaved_segment(
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # Mux with audio (same fade logic as process_segment_video)
-    original_duration = duration - 0.4
-    fade_out_start = max(0, original_duration - 0.1)
-    af_filter = f"afade=t=in:ss=0:d=0.05,afade=t=out:st={fade_out_start}:d=0.1,apad"
+    if audio_path is None:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", concat_path,
+            "-t", str(duration),
+            "-c:v", "copy",
+            "-an",
+            output_path,
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        # Mux with audio (same fade logic as process_segment_video)
+        original_duration = duration - 0.4
+        fade_out_start = max(0, original_duration - 0.1)
+        af_filter = f"afade=t=in:ss=0:d=0.05,afade=t=out:st={fade_out_start}:d=0.1,apad"
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", concat_path,
-        "-i", audio_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-t", str(duration),
-        "-c:v", "copy",
-        "-af", af_filter,
-        "-c:a", "aac",
-        output_path,
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", concat_path,
+            "-i", audio_path,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-t", str(duration),
+            "-c:v", "copy",
+            "-af", af_filter,
+            "-c:a", "aac",
+            output_path,
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # Cleanup temporary files
     for p in temp_parts:

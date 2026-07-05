@@ -16,6 +16,45 @@ import random
 import argparse
 from pathlib import Path
 
+def get_cross_platform_cache_dir(app_name):
+    if sys.platform == "win32":
+        base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, app_name)
+    elif sys.platform == "darwin":
+        return os.path.expanduser(f"~/Library/Caches/{app_name}")
+    else:
+        return os.path.expanduser(f"~/.cache/{app_name}")
+
+def bypass_playwright_node_execution_restriction():
+    try:
+        # Resolve playwright's location dynamically
+        import importlib.util
+        spec = importlib.util.find_spec("playwright")
+        if spec and spec.origin:
+            driver_dir = os.path.join(os.path.dirname(spec.origin), "driver")
+            node_exe = "node.exe" if sys.platform == "win32" else "node"
+            src_node = os.path.join(driver_dir, node_exe)
+            
+            if os.path.exists(src_node):
+                cache_dir = get_cross_platform_cache_dir("playwright_node_cache")
+                os.makedirs(cache_dir, exist_ok=True)
+                dest_node = os.path.join(cache_dir, node_exe)
+                
+                if not os.path.exists(dest_node) or os.path.getsize(src_node) != os.path.getsize(dest_node):
+                    import shutil
+                    shutil.copy2(src_node, dest_node)
+                    
+                if sys.platform != "win32":
+                    import stat
+                    st = os.stat(dest_node)
+                    os.chmod(dest_node, st.st_mode | stat.S_IEXEC)
+                    
+                os.environ["PLAYWRIGHT_NODEJS_PATH"] = dest_node
+    except Exception as e:
+        pass
+
+bypass_playwright_node_execution_restriction()
+
 try:
     from cloakbrowser import launch_persistent_context
     from playwright.sync_api import TimeoutError
@@ -32,7 +71,8 @@ TOP_N = 5
 DOWNLOAD_TIMEOUT_MS = 300000  # 5 minutes
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROFILE_DIR = SCRIPT_DIR / ".envato_session"
+PENDRIVE_PROFILE_DIR = SCRIPT_DIR / ".envato_session"
+LOCAL_PROFILE_DIR = Path(get_cross_platform_cache_dir("envato_sessions")) / "active_session"
 BASE_DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
 
 # Ensure base download directory exists
@@ -61,29 +101,95 @@ class EnvatoElementsDownloader:
 
     def start(self):
         """Launch the stealth browser with persistent session."""
-        print(f"🚀 Launching CloakBrowser (Profile: {PROFILE_DIR.name})...")
+        print(f"🚀 Preparing local cache for browser profile...")
+        
+        # Clean any stale lock files from previous runs to prevent SingletonLock/existing session errors
+        for lock_dir in [PENDRIVE_PROFILE_DIR, LOCAL_PROFILE_DIR]:
+            if lock_dir.exists():
+                for root, dirs, files in os.walk(lock_dir):
+                    for f in files:
+                        if "lock" in f.lower() or f.startswith("Singleton"):
+                            try:
+                                os.remove(os.path.join(root, f))
+                            except:
+                                pass
+                                
+        # Copy profile from FAT32 pendrive to native filesystem to avoid SingletonLock errors
+        if PENDRIVE_PROFILE_DIR.exists():
+            import shutil
+            shutil.copytree(PENDRIVE_PROFILE_DIR, LOCAL_PROFILE_DIR, dirs_exist_ok=True)
+            
+        print(f"🚀 Launching CloakBrowser...")
         
         # We need a persistent context so we don't have to login every time.
         # humanize=True adds realistic mouse movements and typing delays.
         # We handle downloads explicitly by accepting downloads.
-        self.context = launch_persistent_context(
-            PROFILE_DIR,
-            headless=self.headless,
-            humanize=True,
-            accept_downloads=True,
-            args=["--window-size=1920,1080"],
-            viewport={"width": 1920, "height": 1080}
-        )
+        try:
+            self.context = launch_persistent_context(
+                LOCAL_PROFILE_DIR,
+                headless=self.headless,
+                humanize=True,
+                accept_downloads=True,
+                args=["--window-size=1920,1080"],
+                viewport={"width": 1920, "height": 1080}
+            )
+        except Exception as e:
+            if "Executable doesn't exist" in str(e) or "playwright install" in str(e):
+                print("\n   [!] Missing Playwright browser binaries on this computer.")
+                print("   [!] Auto-installing them to your OS native cache folder now (this may take a minute)...")
+                import subprocess
+                subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+                print("   ✅ Playwright browsers installed successfully! Retrying launch...\n")
+                self.context = launch_persistent_context(
+                    LOCAL_PROFILE_DIR,
+                    headless=self.headless,
+                    humanize=True,
+                    accept_downloads=True,
+                    args=["--window-size=1920,1080"],
+                    viewport={"width": 1920, "height": 1080}
+                )
+            else:
+                raise
         self.page = self.context.new_page()
 
     def stop(self):
-        """Close the browser."""
+        """Close the browser and sync profile back to pendrive."""
         if self.context:
             self.context.close()
+            print("💾 Saving browser session back to pendrive...")
+            import shutil
+            # We ignore specific lock files and large cache directories to significantly speed up saving to FAT32 pendrives
+            shutil.copytree(
+                LOCAL_PROFILE_DIR, 
+                PENDRIVE_PROFILE_DIR, 
+                dirs_exist_ok=True, 
+                ignore=shutil.ignore_patterns(
+                    "Singleton*", 
+                    "Cache", 
+                    "CacheStorage", 
+                    "Code Cache", 
+                    "GPUCache", 
+                    "DawnCache", 
+                    "Crashpad", 
+                    "Crash Reports", 
+                    "Network Action Predictor"
+                )
+            )
+    def handle_cookie_consent(self):
+        """Find and click 'Accept all' cookie consent button if present to prevent page overlay issues."""
+        try:
+            accept_btn = self.page.locator("button:visible", has_text=re.compile(r"Accept\s*all", re.IGNORECASE)).first
+            if accept_btn.is_visible():
+                print("   🍪 Cookie consent banner detected. Clicking Accept all...")
+                accept_btn.click()
+                human_delay(1, 2)
+        except Exception:
+            pass
 
     def ensure_logged_in(self):
         """Check if logged in, otherwise pause for manual login."""
         self.page.goto("https://app.envato.com/", wait_until="domcontentloaded")
+        self.handle_cookie_consent()
         
         print("\n" + "!" * 60)
         print("  ACTION REQUIRED:")
@@ -101,8 +207,12 @@ class EnvatoElementsDownloader:
         """Search for items and return URLs."""
         print(f"\n🔍 Searching for {self.media_type}s: '{phrase}'")
         encoded_phrase = phrase.replace(" ", "+")
-        search_url = f"https://app.envato.com/search/all?term={encoded_phrase}"
+        if self.media_type == "photo":
+            search_url = f"https://app.envato.com/search?itemType=photos&term={encoded_phrase}"
+        else:
+            search_url = f"https://app.envato.com/search/all?term={encoded_phrase}"
         self.page.goto(search_url, wait_until="domcontentloaded")
+        self.handle_cookie_consent()
         human_delay(3, 5)
 
         # Scroll down a bit to load results
@@ -113,23 +223,24 @@ class EnvatoElementsDownloader:
 
         links = []
         try:
-            # Envato Elements links typically use /stock-video/ or /video/ for videos,
-            # and /photo/ or -photo/ for photos.
-            search_str1 = f"-{self.media_type}/"
-            search_str2 = f"/{self.media_type}/"
-            
-            self.page.wait_for_selector(f"a[href*='{search_str1}']", timeout=10000)
-            
-            elements = self.page.locator(f"a[href*='{search_str1}']").all()
-            if not elements:
-                elements = self.page.locator(f"a[href*='{search_str2}']").all()
+            if self.media_type == "photo":
+                valid_substrings = ["photo", "image", "picture"]
+            else:
+                valid_substrings = ["video", "motion-graphic"]
                 
+            selector = ", ".join([f"a[href*='{sub}']" for sub in valid_substrings])
+            self.page.wait_for_selector(selector, timeout=10000)
+            
+            elements = self.page.locator(selector).all()
             for el in elements:
                 href = el.get_attribute("href")
-                if href and (search_str1 in href or search_str2 in href) and href not in links:
-                    links.append(href)
-                    if len(links) >= count:
-                        break
+                if href:
+                    # Filter for item page URLs containing the 7-12 character uppercase ID pattern or UUIDv4 pattern
+                    if re.search(r"-[A-Z0-9]{7,12}(?:[/?]|$)|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", href):
+                        if href not in links:
+                            links.append(href)
+                            if len(links) >= count:
+                                break
         except TimeoutError:
             print(f"⚠️  No {self.media_type} results found or page structure changed.")
 
@@ -153,6 +264,7 @@ class EnvatoElementsDownloader:
         """Navigate to an item page, trigger download, and save the file."""
         print(f"\n── Result {index}: {item_url}")
         self.page.goto(item_url, wait_until="domcontentloaded")
+        self.handle_cookie_consent()
         human_delay(2, 4)
 
         # Get item title for filename
@@ -167,8 +279,8 @@ class EnvatoElementsDownloader:
         # We define a base filename without extension first
         base_filename = f"{index}_{sanitize_filename(title)}"
         
-        # Click the download button
-        download_btn = self.page.locator("button:has-text('Download')").first
+        # Click the download button (using a more robust selector that matches 'Download' case-insensitively)
+        download_btn = self.page.locator("button:visible", has_text=re.compile(r"\bDownload\b", re.IGNORECASE)).first
         try:
             download_btn.wait_for(state="visible", timeout=30000)
         except TimeoutError:
@@ -184,10 +296,12 @@ class EnvatoElementsDownloader:
                 download_btn.click()
                 
                 # Check if we need to assign a project (license dialog)
-                project_dialog = self.page.locator("text='Add & Download'").first
+                # We use a robust regex to catch variations like "Add & Download", "Add and Download", "Download without license"
+                project_dialog = self.page.locator("button:visible", has_text=re.compile(r"(Add.*Download|Download without license)", re.IGNORECASE)).first
                 try:
-                    project_dialog.wait_for(state="visible", timeout=3000)
-                    print("   📝 License dialog detected. Clicking 'Add & Download'...")
+                    # Increased timeout to 6000ms to account for slow Envato modal rendering on slow networks
+                    project_dialog.wait_for(state="visible", timeout=6000)
+                    print("   📝 License dialog detected. Confirming download...")
                     project_dialog.click()
                 except TimeoutError:
                     pass

@@ -65,11 +65,62 @@ def clipboard_copy(text: str) -> bool:
 
     return False
 
+def get_downloads_folder():
+    if sys.platform == 'win32':
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders') as key:
+                location = winreg.QueryValueEx(key, '{374DE290-123F-4565-9164-39C4925E467B}')[0]
+                location = os.path.expandvars(location)
+                return location
+        except:
+            pass
+    return str(Path.home() / "Downloads")
+
+def fetch_downloaded_audio(expected_count=1, start_time=0):
+    downloads_dir = get_downloads_folder()
+    
+    if not os.path.exists(downloads_dir):
+        print(f"   [!] Could not locate Downloads folder at {downloads_dir}")
+        return []
+        
+    for attempt in range(3):
+        valid_exts = {".mp3", ".wav", ".m4a"}
+        recent_files = []
+        for f in Path(downloads_dir).iterdir():
+            if f.is_file() and f.suffix.lower() in valid_exts:
+                if f.stat().st_mtime >= start_time:
+                    recent_files.append(f)
+                    
+        if len(recent_files) >= expected_count:
+            recent_files.sort(key=lambda x: x.stat().st_mtime)
+            return recent_files[-expected_count:]
+            
+        if attempt < 2:
+            print(f"   [!] Found {len(recent_files)} recent audio files, expected {expected_count}.")
+            print("   Please ensure the download is complete.")
+            input("   → Press Enter to retry... ")
+        else:
+            print("   [!] Max retries reached.")
+            
+    return []
+
 # Load environment variables
 load_dotenv()
 
+def get_cross_platform_cache_dir(app_name):
+    if sys.platform == "win32":
+        base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, app_name)
+    elif sys.platform == "darwin":
+        return os.path.expanduser(f"~/Library/Caches/{app_name}")
+    else:
+        return os.path.expanduser(f"~/.cache/{app_name}")
+
 # Initialize static FFmpeg binaries (adds ffmpeg and ffprobe to PATH)
-static_ffmpeg.add_paths()
+import static_ffmpeg.run
+platform_key = static_ffmpeg.run.get_platform_key()
+static_ffmpeg.add_paths(download_dir=os.path.join(get_cross_platform_cache_dir("ffmpeg_cache"), platform_key))
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 NVIDIA_NIM_API_KEY = os.getenv("NVIDIA_NIM_API_KEY")
@@ -376,6 +427,54 @@ def get_audio_duration(audio_path):
     output = subprocess.check_output(cmd).decode().strip()
     return float(output)
 
+def is_video_mostly_black(filepath):
+    """
+    Checks if a video file is mostly black/blank using FFmpeg's blackdetect filter.
+    Returns True if more than 35% of the video duration is detected as black.
+    """
+    if not os.path.exists(filepath):
+        return False
+    try:
+        # Get video duration first
+        duration_cmd = [
+            "ffprobe", "-v", "error", 
+            "-show_entries", "format=duration", 
+            "-of", "default=noprint_wrappers=1:nokey=1", 
+            filepath
+        ]
+        duration = float(subprocess.check_output(duration_cmd).decode(errors="replace").strip())
+        if duration <= 0:
+            return True
+            
+        # Run blackdetect
+        cmd = [
+            "ffmpeg", "-i", filepath,
+            "-vf", "blackdetect=d=1.0:pic_th=0.90:pix_th=0.10",
+            "-f", "null",
+            "-"
+        ]
+        res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        output = res.stderr.decode(errors="replace")
+        
+        # Parse blackdetect output lines
+        black_duration = 0.0
+        for line in output.split("\n"):
+            if "black_duration:" in line:
+                match = re.search(r"black_duration:([\d.]+)", line)
+                if match:
+                    black_duration += float(match.group(1))
+                    
+        ratio = black_duration / duration
+        if ratio > 0.35:
+            print(f"   ⚠️  Video {os.path.basename(filepath)} rejected: {ratio:.1%} of duration is black ({black_duration:.1f}s / {duration:.1f}s)")
+            return True
+            
+        return False
+    except Exception as e:
+        print(f"   ⚠️  Error checking video blackness: {e}")
+        return False
+
+
 def process_segment_video(segment, video_path, audio_path, duration, script_hash):
     seg_id = segment["segment_id"]
     output_path = f"temp_{script_hash}_{seg_id}.mp4"
@@ -386,41 +485,63 @@ def process_segment_video(segment, video_path, audio_path, duration, script_hash
         
     print(f"Step 4: Processing video for {seg_id}...")
     
-    # Crop to 9:16 (1080x1920) and trim to exact padded duration. Also normalize fps to 30.
-    # We use a 0.05s fade-in and 0.1s fade-out on the original audio to eliminate any pops, clicks, or abruptly cut breaths.
-    # We then use the 'apad' filter to pad the audio with silence at the end so it matches the video duration.
-    original_duration = duration - 0.4
-    fade_out_start = max(0, original_duration - 0.1)
-    af_filter = f"afade=t=in:ss=0:d=0.05,afade=t=out:st={fade_out_start}:d=0.1,apad"
-    
-    cmd = [
-        "ffmpeg", "-y",
-        "-stream_loop", "-1",
-        "-i", video_path,
-        "-i", audio_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-t", str(duration),
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,setsar=1,format=yuv420p",
-        "-c:v", "libx264",
-        "-af", af_filter,
-        "-c:a", "aac",
-        output_path
-    ]
-    
+    if audio_path is None:
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1",
+            "-i", video_path,
+            "-t", str(duration),
+            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,setsar=1,format=yuv420p",
+            "-c:v", "libx264",
+            "-an",
+            output_path
+        ]
+    else:
+        original_duration = duration - 0.4
+        fade_out_start = max(0, original_duration - 0.1)
+        af_filter = f"afade=t=in:ss=0:d=0.05,afade=t=out:st={fade_out_start}:d=0.1,apad"
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1",
+            "-i", video_path,
+            "-i", audio_path,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-t", str(duration),
+            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,setsar=1,format=yuv420p",
+            "-c:v", "libx264",
+            "-af", af_filter,
+            "-c:a", "aac",
+            output_path
+        ]
+        
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return output_path
 
-def stitch_videos(video_paths, script_hash):
+def stitch_videos(video_paths, script_hash, master_audio_path=None):
     print("Step 5: Stitching segments together (with crossfade transitions)...")
     output_path = f"merged_output_{script_hash}.mp4"
     
     CROSSFADE_DURATION = 0.3  # seconds of overlap between segments
 
     if len(video_paths) == 1:
-        # Single segment — just copy it
-        import shutil as _shutil
-        _shutil.copy2(video_paths[0], output_path)
+        if master_audio_path:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_paths[0],
+                "-i", master_audio_path,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                output_path
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            # Single segment — just copy it
+            import shutil as _shutil
+            _shutil.copy2(video_paths[0], output_path)
         return output_path
 
     # Build xfade filter chain for smooth transitions between segments
@@ -463,42 +584,60 @@ def stitch_videos(video_paths, script_hash):
 
         cumulative_dur = offset + durations[i + 1]
 
-    # Audio: concat all audio streams
-    audio_inputs = "".join(f"[{i}:a]" for i in range(n))
-    filter_parts.append(f"{audio_inputs}concat=n={n}:v=0:a=1[aout]")
-
-    filter_complex = ";\n".join(filter_parts)
-
-    cmd = ["ffmpeg", "-y"]
-    for vp in video_paths:
-        cmd.extend(["-i", vp])
-    cmd.extend([
-        "-filter_complex", filter_complex,
-        "-map", "[vout]",
-        "-map", "[aout]",
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        output_path
-    ])
+    if master_audio_path:
+        filter_complex = ";\n".join(filter_parts)
+        cmd = ["ffmpeg", "-y"]
+        for vp in video_paths:
+            cmd.extend(["-i", vp])
+        cmd.extend(["-i", master_audio_path])
+        
+        master_audio_idx = len(video_paths)
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", f"{master_audio_idx}:a:0",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            output_path
+        ])
+    else:
+        # Audio: concat all audio streams
+        audio_inputs = "".join(f"[{i}:a]" for i in range(n))
+        filter_parts.append(f"{audio_inputs}concat=n={n}:v=0:a=1[aout]")
+        filter_complex = ";\n".join(filter_parts)
+        
+        cmd = ["ffmpeg", "-y"]
+        for vp in video_paths:
+            cmd.extend(["-i", vp])
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "[aout]",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            output_path
+        ])
 
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
-        # Fallback to simple concat if xfade fails (e.g. mismatched formats)
         print("   ⚠️  Crossfade failed, falling back to simple concat...")
         concat_txt = f"concat_{script_hash}.txt"
         with open(concat_txt, "w") as f:
             for vp in video_paths:
                 f.write(f"file '{vp}'\n")
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", concat_txt,
-            "-c", "copy",
-            output_path
-        ]
+                
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt]
+        if master_audio_path:
+            cmd.extend(["-i", master_audio_path, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac"])
+        else:
+            cmd.extend(["-c", "copy"])
+        cmd.append(output_path)
+            
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     return output_path
@@ -523,7 +662,7 @@ PlayResY: 1920
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H90000000,1,0,0,0,100,100,0,0,3,18,0,2,100,100,250,1
-Style: Highlight,Impact,140,{ass_color},&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,8,12,5,0,0,0,1
+Style: Highlight,Arial,55,{ass_color},&H000000FF,&H00000000,&H90000000,1,0,0,0,100,100,0,0,3,12,0,5,100,100,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -537,21 +676,33 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         cs = int(round((seconds - int(seconds)) * 100))
         return f"{hours}:{minutes:02d}:{secs:02d}.{cs:02d}"
         
-    def write_chunks(words_data, global_offset):
+    def write_chunks(words_data, global_offset, max_end_time):
         nonlocal ass_content
         if not words_data: return
         CHUNK_SIZE = 4
         chunks = [words_data[i:i + CHUNK_SIZE] for i in range(0, len(words_data), CHUNK_SIZE)]
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
+            # No pre-offset for perfect sync
             c_start = global_offset + chunk[0]["start"]
             c_end = global_offset + chunk[-1]["end"]
+            
+            # Make subtitle linger on screen during pauses
+            if i + 1 < len(chunks):
+                next_start = global_offset + chunks[i+1][0]["start"]
+                # Extend until just before next subtitle, capped at 1.0s extension
+                c_end = max(c_end, min(next_start - 0.05, c_end + 1.0))
+            else:
+                # Last chunk in segment: cap at max_end_time so it never overlaps with next segment
+                c_end = max(c_end, min(max_end_time - 0.05, c_end + 1.0))
+                
             text = " ".join([w["word"] for w in chunk])
             ass_content += f"Dialogue: 0,{format_time_ass(c_start)},{format_time_ass(c_end)},Default,,0,0,0,,{text}\n"
 
     for seg, duration in segment_durations:
         start_time = current_time
         end_time = current_time + duration
-        current_time = end_time
+        # Align with the crossfade timeline by subtracting the 0.3s transition overlap
+        current_time = end_time - 0.3
         
         words_data = seg.get("word_timestamps", [])
         if not words_data:
@@ -589,41 +740,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 theme_words = words_data[words_before : words_before + theme_len]
                 after_words = words_data[words_before + theme_len:]
                 
-                write_chunks(before_words, start_time)
+                t_start = start_time + theme_words[0]["start"] if theme_words else end_time
+                write_chunks(before_words, start_time, t_start)
                 
                 if theme_words:
-                    t_start = start_time + theme_words[0]["start"]
                     t_dur = max(0.1, theme_words[-1]["end"] - theme_words[0]["start"])
                     
                     theme_text = " ".join([w["word"] for w in theme_words]).upper()
-                    chars = list(theme_text)
-                    type_speed = min(0.12, t_dur / max(1, len(chars)))
                     
-                    # Calculate extended duration for the pop animation to linger
-                    a_dur = max(0.1, after_words[-1]["end"] - after_words[0]["start"]) if after_words else 0
-                    extended_dur = 0
+                    # Calculate extended duration for the theme subtitle to persist
+                    extended_dur = 1.5  # default/minimum persistence
                     if after_words:
-                        words_to_keep = min(6, len(after_words))
-                        extended_dur = (words_to_keep / len(after_words)) * a_dur
-                        extended_dur = min(3.0, extended_dur)
+                        words_to_keep = min(4, len(after_words))
+                        words_dur = after_words[words_to_keep - 1]["end"] - after_words[0]["start"]
+                        # Persist for the duration of the next 3-4 words, up to at most 1.5s, and at least 1.0s
+                        extended_dur = max(1.0, min(1.5, words_dur))
+                    else:
+                        extended_dur = 1.5
                         
                     final_end_time = t_start + t_dur + extended_dur
                     
-                    c_start = t_start
-                    for i in range(1, len(chars) + 1):
-                        partial = "".join(chars[:i])
-                        is_last = (i == len(chars))
-                        c_end = final_end_time if is_last else c_start + type_speed
-                        
-                        if is_last:
-                            stylized_text = f"{{\\fscx115\\fscy115\\t(0,250,\\fscx100\\fscy100)\\blur2}}{partial}"
-                        else:
-                            stylized_text = partial
-                            
-                        ass_content += f"Dialogue: 0,{format_time_ass(c_start)},{format_time_ass(c_end)},Highlight,,0,0,0,,{stylized_text}\n"
-                        c_start = c_end
-                        
-                    write_chunks(after_words, start_time)
+                    # Smooth fade-in (200ms) and fade-out (200ms) with no jarring pop/zoom animation
+                    stylized_text = f"{{\\fad(200,200)}}{theme_text}"
+                    ass_content += f"Dialogue: 0,{format_time_ass(t_start)},{format_time_ass(final_end_time)},Highlight,,0,0,0,,{stylized_text}\n"
+                    
+                    write_chunks(after_words, start_time, end_time)
                     
                     theme_start = t_start
                     theme_end = final_end_time
@@ -631,7 +772,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     theme_matched = True
         
         if not theme_matched:
-            write_chunks(words_data, start_time)
+            write_chunks(words_data, start_time, end_time)
         
     ass_path = f"subtitles_{script_hash}.ass"
     with open(ass_path, "w") as f:
@@ -695,7 +836,7 @@ def generate_and_burn_subtitles(video_path, theme_word, theme_hex_color, theme_s
                 filter_complex += img_filter
                 
                 next_bg = f"[bg{i+1}]" if i < len(theme_images) - 1 else "[v_overlaid]"
-                overlay_filter = f"{last_bg}[img{i}]overlay=x={x_pos}:y={y_pos}:enable='between(t,{t_s},{theme_end + 0.3:.2f})'{next_bg};"
+                overlay_filter = f"{last_bg}[img{i}]overlay=x={x_pos}:y={y_pos}:enable='between(t,{t_s},{theme_end + 0.3:.2f})':eof_action=pass{next_bg};"
                 filter_complex += overlay_filter
                 
                 last_bg = next_bg
@@ -709,7 +850,6 @@ def generate_and_burn_subtitles(video_path, theme_word, theme_hex_color, theme_s
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
                 "-c:a", "copy",
-                "-shortest",
                 output_path
             ])
 
@@ -804,10 +944,19 @@ def main():
                 print(f"Failed to unzip {zf}: {e}")
                 
         files = [f for f in os.listdir(download_dir) if f.lower().endswith(valid_exts)]
+        is_existing_valid = False
         if files:
-            video_paths[seg_id] = str(download_dir / files[0])
-            print(f"Video already exists for {seg_id} -> {video_paths[seg_id]}")
-        else:
+            existing_file = download_dir / files[0]
+            if is_video_mostly_black(str(existing_file)):
+                print(f"   ⚠️  Existing cached video for {seg_id} is mostly black/blank. Deleting to re-download...")
+                shutil.rmtree(str(download_dir), ignore_errors=True)
+                download_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                video_paths[seg_id] = str(existing_file)
+                print(f"Video already exists and is valid for {seg_id} -> {video_paths[seg_id]}")
+                is_existing_valid = True
+                
+        if not is_existing_valid:
             videos_to_download.append(seg)
             
     if videos_to_download:
@@ -836,29 +985,46 @@ def main():
                     # Modify downloader's destination dynamically
                     downloader.download_dir = seg_dir
                     
-                    links = downloader.search_and_get_links(query, 1)
+                    # Search for up to 3 links to fallback if a video is mostly black
+                    links = downloader.search_and_get_links(query, 3)
                     success = False
                     if links:
-                        success = downloader.download_item(1, links[0])
-                        if success:
-                            # Handle zip files
-                            downloaded_zips = [f for f in os.listdir(seg_dir) if f.lower().endswith('.zip')]
-                            for zf in downloaded_zips:
-                                zip_path = seg_dir / zf
-                                print(f"   Unzipping {zf}...")
-                                try:
-                                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                                        zip_ref.extractall(seg_dir)
-                                    os.remove(zip_path)
-                                    print(f"   Deleted {zf}")
-                                except Exception as e:
-                                    print(f"   Error unzipping {zf}: {e}")
+                        for link_idx, link in enumerate(links):
+                            print(f"   → Trying search result {link_idx + 1}/{len(links)}...")
+                            # Clean the directory first in case of a previous failed download attempt
+                            if os.path.exists(seg_dir):
+                                shutil.rmtree(str(seg_dir), ignore_errors=True)
+                            seg_dir.mkdir(parents=True, exist_ok=True)
                             
-                            files = [f for f in os.listdir(seg_dir) if f.lower().endswith(valid_exts)]
-                            if files:
-                                video_paths[seg_id] = str(seg_dir / files[0])
+                            download_success = downloader.download_item(link_idx + 1, link)
+                            if download_success:
+                                # Handle zip files
+                                downloaded_zips = [f for f in os.listdir(seg_dir) if f.lower().endswith('.zip')]
+                                for zf in downloaded_zips:
+                                    zip_path = seg_dir / zf
+                                    print(f"   Unzipping {zf}...")
+                                    try:
+                                        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                                            zip_ref.extractall(seg_dir)
+                                        os.remove(zip_path)
+                                        print(f"   Deleted {zf}")
+                                    except Exception as e:
+                                        print(f"   Error unzipping {zf}: {e}")
+                                
+                                files = [f for f in os.listdir(seg_dir) if f.lower().endswith(valid_exts)]
+                                if files:
+                                    candidate_file = seg_dir / files[0]
+                                    if is_video_mostly_black(str(candidate_file)):
+                                        print(f"   ❌ Candidate video {files[0]} is mostly black/blank. Trying next search result...")
+                                        shutil.rmtree(str(seg_dir), ignore_errors=True)
+                                    else:
+                                        video_paths[seg_id] = str(candidate_file)
+                                        success = True
+                                        break
+                                else:
+                                    print("   ❌ No valid video files found in download.")
                             else:
-                                success = False
+                                print(f"   ❌ Download failed for search result {link_idx + 1}")
                     
                     if not success:
                         failed_downloads.append(seg)
@@ -912,8 +1078,7 @@ def main():
                 if links:
                     success = downloader.download_item(1, links[0])
                     if success:
-                        # Rename the downloaded photo to the exact phrase
-                        downloaded_photos = [f for f in os.listdir(dst_subthemes) if f.startswith("1_photo_item")]
+                        downloaded_photos = [f for f in os.listdir(dst_subthemes) if f.startswith("1_")]
                         for photo in downloaded_photos:
                             ext = os.path.splitext(photo)[1]
                             old_path = dst_subthemes / photo
@@ -959,7 +1124,12 @@ def main():
         full_text = " ".join([seg["voiceover_text"] for seg in segments])
         
         audio_ready = False
-        if elevenlabs_available:
+        
+        if os.path.exists(full_audio_path):
+            print(f"   ✅ Using cached master audio: {full_audio_path}")
+            audio_ready = True
+            
+        if not audio_ready and elevenlabs_available:
             audio_ready = generate_voiceover_api(full_text, full_audio_path)
         
         if not audio_ready:
@@ -988,41 +1158,67 @@ def main():
                     clipboard_copy(full_text)
                     print("📋 Full script copied to clipboard!")
                     
-                input(f"   → Generate TTS manually, save it precisely as '{full_audio_path}' in the current folder, and press Enter...")
+                import time
+                prompt_time = time.time()
+                input("   → Press Enter when you've downloaded the TTS file from ElevenLabs...")
+                
+                fetched_files = fetch_downloaded_audio(expected_count=1, start_time=prompt_time)
+                
+                if fetched_files:
+                    import shutil
+                    shutil.move(str(fetched_files[0]), full_audio_path)
+                    print(f"   ✅ Auto-moved {fetched_files[0].name} to {full_audio_path}")
+                else:
+                    manual_path = input("   → Auto-detect failed. Paste the absolute path to your MP3 for the full script: ").strip().strip("\"'")
+                    if os.path.exists(manual_path):
+                        import shutil
+                        shutil.copy2(manual_path, full_audio_path)
             
         aligned_words = transcribe_and_align(full_audio_path, full_text)
         
+        audio_dur = get_audio_duration(full_audio_path)
+        
         import string
-        print("\n=== Splitting Full Audio into Segments ===")
+        print("\n=== Calculating Segment Durations ===")
         word_ptr = 0
-        for seg in segments:
-            seg_id = seg["segment_id"]
+        for i, seg in enumerate(segments):
             seg_text = seg["voiceover_text"]
             
             seg_word_count = len([w for w in seg_text.split() if w.strip(string.punctuation).lower()])
             seg_words = aligned_words[word_ptr : word_ptr + seg_word_count]
             word_ptr += seg_word_count
             
-            if seg_words:
-                start_time = seg_words[0]["start"]
-                end_time = seg_words[-1]["end"]
-            else:
-                start_time, end_time = 0.0, 1.0
-                
-            end_time += 0.3
+            start_time = seg_words[0]["start"] if seg_words else 0.0
             
-            seg_audio = f"{script_hash}_{seg_id}_audio.mp3"
-            if not os.path.exists(seg_audio):
-                print(f"   Extracting audio for {seg_id} ({start_time:.2f}s - {end_time:.2f}s)...")
-                cmd = ["ffmpeg", "-y", "-i", full_audio_path, "-ss", str(start_time), "-to", str(end_time), "-c", "copy", seg_audio]
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Calculate perfect display duration bridging to the next segment's first word
+            if i + 1 < len(segments):
+                next_word_ptr = word_ptr
+                next_seg_text = segments[i+1]["voiceover_text"]
+                next_word_count = len([w for w in next_seg_text.split() if w.strip(string.punctuation).lower()])
+                next_seg_words = aligned_words[next_word_ptr : next_word_ptr + next_word_count]
+                next_start = next_seg_words[0]["start"] if next_seg_words else start_time + 1.0
                 
+                # For the first segment, measure display duration from 0.0 of the audio track
+                # to align the video timeline with the absolute audio start.
+                display_dur = next_start - (0.0 if i == 0 else start_time)
+                raw_video_dur = display_dur + 0.3 # Provide extra 0.3s of video to feed the crossfade transition
+            else:
+                # Last segment should stretch to the end of the full audio track, 
+                # ensuring the video doesn't end abruptly and all trailing subtitles are displayed.
+                end_time = max(aligned_words[-1]["end"], audio_dur) if aligned_words else start_time + 1.0
+                display_dur = end_time - (0.0 if i == 0 else start_time)
+                raw_video_dur = display_dur
+                
+            seg["display_dur"] = display_dur
+            seg["raw_video_dur"] = raw_video_dur
+            
+            # Save relative word timestamps for ASS subtitle generation
             seg["word_timestamps"] = []
             for w in seg_words:
                 seg["word_timestamps"].append({
                     "word": w["word"],
-                    "start": max(0.0, w["start"] - start_time),
-                    "end": max(0.0, w["end"] - start_time)
+                    "start": max(0.0, w["start"] - (0.0 if i == 0 else start_time)),
+                    "end": max(0.0, w["end"] - (0.0 if i == 0 else start_time))
                 })
     else:
         print("Using legacy segment-by-segment generation (whisper unavailable).")
@@ -1061,33 +1257,40 @@ def main():
                 for seg in missing_audio_segments:
                     generate_voiceover_edge_tts(seg["voiceover_text"], f"{script_hash}_{seg['segment_id']}_audio.mp3")
             else:
-                manual_dir = os.path.abspath("manual_audio")
-                os.makedirs(manual_dir, exist_ok=True)
                 for idx, seg in enumerate(missing_audio_segments, 1):
                     text = seg["voiceover_text"]
                     clipboard_copy(text)
                     print(f"\n📋 [{idx}/{len(missing_audio_segments)}] Segment '{seg['segment_id']}' copied to clipboard:")
                     print(f"   ── TEXT START ──\n   {text}\n   ── TEXT END ──")
-                    input("   → Press Enter when you've generated & downloaded this segment's audio... ")
                     
-                import shutil
-                dl_mp3s = sorted([f for f in Path.home().joinpath("Downloads").iterdir() if f.suffix.lower() == '.mp3' and f.stat().st_mtime >= time.time() - 1800], key=lambda f: f.stat().st_mtime)
-                if dl_mp3s:
-                    if input(f"\nMove {len(dl_mp3s)} recent MP3(s) from ~/Downloads to 'manual_audio/'? (Y/n): ").strip().lower() != 'n':
-                        for f in dl_mp3s: shutil.move(str(f), str(Path(manual_dir) / f.name))
-                        
-                mp3_files = sorted([f for f in os.listdir(manual_dir) if f.lower().endswith('.mp3')], key=lambda x: os.path.getmtime(os.path.join(manual_dir, x)))
-                for i, file_name in enumerate(mp3_files):
-                    if i < len(missing_audio_segments):
-                        os.rename(os.path.join(manual_dir, file_name), f"{script_hash}_{missing_audio_segments[i]['segment_id']}_audio.mp3")
+                    import time
+                    prompt_time = time.time()
+                    input("   → Press Enter when you've downloaded this segment's audio... ")
+                    
+                    fetched_files = fetch_downloaded_audio(expected_count=1, start_time=prompt_time)
+                    dest_path = f"{script_hash}_{seg['segment_id']}_audio.mp3"
+                    
+                    if fetched_files:
+                        import shutil
+                        shutil.move(str(fetched_files[0]), dest_path)
+                        print(f"   ✅ Auto-moved {fetched_files[0].name} to {dest_path}")
+                    else:
+                        manual_path = input("   → Auto-detect failed. Paste the absolute path to this segment's MP3: ").strip().strip("\"'")
+                        if os.path.exists(manual_path):
+                            import shutil
+                            shutil.copy2(manual_path, dest_path)
                 print("✅ Manual audio mapping complete!")
 
     # Verify all audio is present before proceeding
-    segments = [s for s in segments if os.path.exists(f"{script_hash}_{s['segment_id']}_audio.mp3")]
-
-    if not segments:
-        print("No segments have audio. Exiting.")
-        return
+    if whisper_available:
+        if not os.path.exists(f"full_audio_{script_hash}.mp3"):
+            print("Full audio missing. Exiting.")
+            return
+    else:
+        segments = [s for s in segments if os.path.exists(f"{script_hash}_{s['segment_id']}_audio.mp3")]
+        if not segments:
+            print("No segments have audio. Exiting.")
+            return
 
     # ---------------------------------------------------------
     # PHASE 3: PROCESS & STITCH
@@ -1099,10 +1302,15 @@ def main():
     for seg in segments:
         seg_id = seg["segment_id"]
         vid_path = video_paths[seg_id]
-        aud_path = f"{script_hash}_{seg_id}_audio.mp3"
         
-        # Add 0.4 seconds of padding for a natural pacing pause
-        duration = get_audio_duration(aud_path) + 0.4
+        if whisper_available:
+            aud_path = None
+            duration = seg["raw_video_dur"]
+        else:
+            aud_path = f"{script_hash}_{seg_id}_audio.mp3"
+            # Add 0.4 seconds of padding for a natural pacing pause
+            duration = get_audio_duration(aud_path) + 0.4
+            
         segment_durations.append((seg, duration))
         
         if seg_id in subtheme_matches and subtheme_video_map:
@@ -1110,18 +1318,24 @@ def main():
             clips = compute_interleave_plan(
                 seg, subtheme_matches[seg_id], duration, subtheme_video_map,
             )
-            final_seg_path = build_interleaved_segment(
-                clips, vid_path, aud_path, duration, seg_id, script_hash
-            )
+            has_subtheme = any(c.clip_type == 'subtheme' for c in clips)
+            
+            final_seg_path = None
+            if has_subtheme:
+                final_seg_path = build_interleaved_segment(
+                    clips, vid_path, aud_path, duration, seg_id, script_hash
+                )
+                
             if final_seg_path is None:
-                # Fallback to normal processing if interleaving failed
+                # Fallback to normal processing if interleaving failed or wasn't needed
                 final_seg_path = process_segment_video(seg, vid_path, aud_path, duration, script_hash)
         else:
             final_seg_path = process_segment_video(seg, vid_path, aud_path, duration, script_hash)
         
         processed_videos.append(final_seg_path)
         
-    merged_video = stitch_videos(processed_videos, script_hash)
+    master_audio = f"full_audio_{script_hash}.mp3" if whisper_available else None
+    merged_video = stitch_videos(processed_videos, script_hash, master_audio)
     
     # Generate subtitles file based on timings
     theme_start, theme_end, ass_path = create_ass(segment_durations, theme_word, theme_hex_color, script_hash)

@@ -16,3 +16,5 @@ opencv-python
 numpy
 faster-whisper
 psutil
+playwright
+cloakbrowser
