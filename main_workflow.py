@@ -234,6 +234,11 @@ def get_script_and_segments():
     The theme_word MUST be an exact substring of the script text.
     You must also select a vibrant Hex color code (6 characters, no #) that matches this theme.
     
+    CRITICAL INSTRUCTION FOR SEARCH QUERIES: 
+    The 'envato_search_query' MUST BE EXACTLY 1 TO 2 WORDS MAX.
+    It MUST be extremely generic and literal (e.g. 'skyscraper', 'wind', 'glass', 'gears').
+    NEVER use abstract metaphors or complex phrases (do NOT use 'mechanical lung', 'counteracting', or 'stability animation'). If the text is abstract, choose the single most visually prominent physical noun.
+    
     Output ONLY a JSON object with this exact structure:
     {{
       "theme_word": "The core concept",
@@ -242,7 +247,7 @@ def get_script_and_segments():
         {{
           "segment_id": "seg_1",
           "voiceover_text": "the exact text to be spoken",
-          "envato_search_query": "3-5 word search query"
+          "envato_search_query": "1-2 broad keywords"
         }}
       ]
     }}
@@ -303,7 +308,7 @@ def get_script_and_segments():
 
 def generate_voiceover_api(text, audio_path):
     # Check if audio already exists
-    if os.path.exists(audio_path):
+    if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
         print(f"   Audio already exists -> {audio_path}")
         return True
         
@@ -479,7 +484,7 @@ def process_segment_video(segment, video_path, audio_path, duration, script_hash
     seg_id = segment["segment_id"]
     output_path = f"temp_{script_hash}_{seg_id}.mp4"
     
-    if os.path.exists(output_path):
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         print(f"Step 4: Processed video already exists for {seg_id} -> {output_path}")
         return output_path
         
@@ -1038,9 +1043,30 @@ def main():
     # Check if all videos are present
     missing_videos = [s for s in segments if s["segment_id"] not in video_paths]
     if missing_videos:
-        print(f"Warning: Could not download videos for {len(missing_videos)} segments.")
-        # Proceed with what we have
-        segments = [s for s in segments if s["segment_id"] in video_paths]
+        print(f"Warning: Could not download videos for {len(missing_videos)} segments. Using fallback videos.")
+        # Do not drop segments! Use the video from a previous valid segment.
+        for i, seg in enumerate(segments):
+            seg_id = seg["segment_id"]
+            if seg_id not in video_paths:
+                fallback_path = None
+                # Try finding previous valid video
+                for j in range(i - 1, -1, -1):
+                    prev_id = segments[j]["segment_id"]
+                    if prev_id in video_paths:
+                        fallback_path = video_paths[prev_id]
+                        break
+                # If none before, find next valid video
+                if not fallback_path:
+                    for j in range(i + 1, len(segments)):
+                        next_id = segments[j]["segment_id"]
+                        if next_id in video_paths:
+                            fallback_path = video_paths[next_id]
+                            break
+                if fallback_path:
+                    print(f"   Using fallback video for {seg_id}")
+                    video_paths[seg_id] = fallback_path
+                else:
+                    print(f"   CRITICAL ERROR: No fallback video available for {seg_id}!")
         
     if not segments:
         print("No segments have videos. Exiting.")
@@ -1180,22 +1206,40 @@ def main():
         
         import string
         print("\n=== Calculating Segment Durations ===")
+        # Pre-calculate robust alignment using character matching
+        def clean_chars(s):
+            return "".join(c.lower() for c in s if c.isalnum())
+            
         word_ptr = 0
         for i, seg in enumerate(segments):
             seg_text = seg["voiceover_text"]
+            target_len = len(clean_chars(seg_text))
             
-            seg_word_count = len([w for w in seg_text.split() if w.strip(string.punctuation).lower()])
-            seg_words = aligned_words[word_ptr : word_ptr + seg_word_count]
-            word_ptr += seg_word_count
+            seg_words = []
+            collected_chars = ""
             
+            while word_ptr < len(aligned_words):
+                w = aligned_words[word_ptr]
+                seg_words.append(w)
+                collected_chars += clean_chars(w["word"])
+                word_ptr += 1
+                if len(collected_chars) >= target_len:
+                    break
+                    
+            if i == len(segments) - 1 and word_ptr < len(aligned_words):
+                while word_ptr < len(aligned_words):
+                    seg_words.append(aligned_words[word_ptr])
+                    word_ptr += 1
+                    
+            seg["word_timestamps_raw"] = seg_words
+            
+        for i, seg in enumerate(segments):
+            seg_words = seg["word_timestamps_raw"]
             start_time = seg_words[0]["start"] if seg_words else 0.0
             
             # Calculate perfect display duration bridging to the next segment's first word
             if i + 1 < len(segments):
-                next_word_ptr = word_ptr
-                next_seg_text = segments[i+1]["voiceover_text"]
-                next_word_count = len([w for w in next_seg_text.split() if w.strip(string.punctuation).lower()])
-                next_seg_words = aligned_words[next_word_ptr : next_word_ptr + next_word_count]
+                next_seg_words = segments[i+1]["word_timestamps_raw"]
                 next_start = next_seg_words[0]["start"] if next_seg_words else start_time + 1.0
                 
                 # For the first segment, measure display duration from 0.0 of the audio track
