@@ -191,8 +191,28 @@ class EnvatoElementsDownloader:
         self.page.goto("https://app.envato.com/", wait_until="domcontentloaded")
         self.handle_cookie_consent()
         
+        print("🔍 Checking Envato login status...")
+        try:
+            # Look for the user profile button/avatar in the nav bar
+            # Alternatively, check that "Sign In" is absent
+            profile_btn = self.page.locator("button[data-test-selector='user-menu-trigger']").first
+            sign_in_btn = self.page.locator("a[href*='sign_in']").first
+            
+            # Wait up to 5 seconds to see which one appears
+            try:
+                self.page.wait_for_selector("button[data-test-selector='user-menu-trigger'], a[href*='sign_in']", timeout=5000)
+            except TimeoutError:
+                pass
+                
+            if profile_btn.is_visible() and not sign_in_btn.is_visible():
+                print("✅ Auto-detected active Envato session! Proceeding...")
+                return
+        except Exception as e:
+            print(f"⚠️ Auto-detection encountered an error: {e}")
+
         print("\n" + "!" * 60)
         print("  ACTION REQUIRED:")
+        print("  Envato login could not be automatically verified.")
         print("  Please look at the automated browser window.")
         print("  If you are NOT logged in, please log into Envato Elements now.")
         print("  Once you are fully logged in (or if you already are),")
@@ -210,7 +230,7 @@ class EnvatoElementsDownloader:
         if self.media_type == "photo":
             search_url = f"https://app.envato.com/search?itemType=photos&term={encoded_phrase}"
         else:
-            search_url = f"https://app.envato.com/search/all?term={encoded_phrase}"
+            search_url = f"https://app.envato.com/search?itemType=stock-video&term={encoded_phrase}&filter.orientation=Vertical"
         self.page.goto(search_url, wait_until="domcontentloaded")
         self.handle_cookie_consent()
         human_delay(3, 5)
@@ -284,8 +304,8 @@ class EnvatoElementsDownloader:
         try:
             download_btn.wait_for(state="visible", timeout=30000)
         except TimeoutError:
-            print("   ❌ 'Download' button not found after waiting. You may need a subscription or the page structure changed.")
-            return False
+            print("   ❌ 'Download' button not found after waiting.")
+            return "UNAUTHORIZED"
 
         # The click must be wrapped INSIDE expect_download, otherwise Playwright misses the event 
         # and the browser downloads it natively into the default Downloads folder.
@@ -295,15 +315,18 @@ class EnvatoElementsDownloader:
                 print("   🖱️  Clicking Download button...")
                 download_btn.click()
                 
-                # Check if we need to assign a project (license dialog)
-                # We use a robust regex to catch variations like "Add & Download", "Add and Download", "Download without license"
                 project_dialog = self.page.locator("button:visible", has_text=re.compile(r"(Add.*Download|Download without license)", re.IGNORECASE)).first
                 try:
-                    # Increased timeout to 6000ms to account for slow Envato modal rendering on slow networks
-                    project_dialog.wait_for(state="visible", timeout=6000)
-                    print("   📝 License dialog detected. Confirming download...")
-                    project_dialog.click()
+                    if project_dialog.wait_for(state="visible", timeout=6000):
+                        print("   📝 License dialog detected. Confirming download...")
+                        project_dialog.click()
                 except TimeoutError:
+                    pass
+                    
+                # Force pause any playing videos to save bandwidth/CPU
+                try:
+                    self.page.evaluate("document.querySelectorAll('video').forEach(v => v.pause());")
+                except:
                     pass
                     
             download = download_info.value

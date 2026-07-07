@@ -13,23 +13,6 @@ import select
 from pathlib import Path
 from dotenv import load_dotenv
 
-def timed_input(prompt, timeout):
-    """
-    Waits for user input from stdin with a timeout.
-    Returns True if the user pressed Enter before the timeout,
-    otherwise returns False.
-    Supported on Unix-like systems (Linux/macOS).
-    """
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
-    ready, _, _ = select.select([sys.stdin], [], [], timeout)
-    if ready:
-        sys.stdin.readline()
-        return True
-    else:
-        print("\n⏳ Timeout reached. Auto-proceeding...")
-        return False
-
 def clipboard_copy(text: str) -> bool:
     """
     Attempts to copy text to the clipboard using a chain of fallbacks:
@@ -119,7 +102,7 @@ def fetch_downloaded_audio(expected_count=1, start_time=0):
             print("   Please ensure the download is complete.")
             input("   → Press Enter to retry... ")
         else:
-            print(f"   [!] Max retries reached.")
+            print("   [!] Max retries reached.")
             
     return []
 
@@ -195,31 +178,16 @@ nim_client = OpenAI(
     api_key=NVIDIA_NIM_API_KEY
 )
 
-def get_script_and_segments():
-    print("Step 1: Topic & Script Generation")
+def get_script_and_segments(old_script_text, old_segments_data):
+    print("Step 1: Topic & Script Generation (Manual Rerun)")
     script_text = ""
     if os.path.exists("CurrentScript.md"):
         with open("CurrentScript.md", "r") as f:
             script_text = f.read().strip()
             
     if not script_text:
-        print("CurrentScript.md not found or empty. Generating topic and script via NIM...")
-        prompt = """
-        You are a professional video producer. Generate a short script for a YouTube Shorts video (under 60 seconds).
-        Topic: A fascinating and constant topic (e.g. interesting facts, history, or science).
-        Output ONLY the raw script text. Do not include any formatting or conversational text.
-        """
-        response = nim_client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024
-        )
-        script_text = response.choices[0].message.content.strip()
-        with open("CurrentScript.md", "w") as f:
-            f.write(script_text)
-        print("Generated and saved script to CurrentScript.md")
-    else:
-        print("Loaded existing script from CurrentScript.md")
+        print("CurrentScript.md not found or empty.")
+        return None
         
     import re
     # Extract dynamic sub-themes from the script
@@ -250,22 +218,30 @@ def get_script_and_segments():
         except Exception as e:
             print(f"Error checking cache: {e}")
             
+    print("Segmenting modified script using previous segments as reference...")
+    
+    # Dump old segments for prompt
+    old_segments_json_str = json.dumps(old_segments_data, indent=2)
+    
     segment_prompt = f"""
-    You are a video editor. Break the following script down into distinct visual segments based on CLAUSES, not sentences.
-    A clause is a grammatical unit containing a subject, verb, and object.
-    If a sentence has multiple distinct clauses (e.g., "The building collapsed, and the dust rose into the air"), you MUST break it down into multiple segments (e.g., one segment for "The building collapsed" and another for "and the dust rose into the air").
-    A single segment should NEVER exceed one full sentence, and should usually be just one clause. Each segment will get its own search term.
+    You are a video editor. The script has been slightly modified.
     
-    You must also identify ONE primary theme concept (1-3 words max) that is the absolute core subject of the video. 
-    The theme_word MUST be an exact substring of the script text.
-    You must also select a vibrant Hex color code (6 characters, no #) that matches this theme.
+    Old Script:
+    {old_script_text}
     
-    CRITICAL INSTRUCTION FOR SEARCH QUERIES: 
-    The 'envato_search_query' MUST BE EXACTLY 1 TO 2 WORDS MAX.
-    It MUST be extremely generic and literal (e.g. 'skyscraper', 'wind', 'glass', 'gears').
-    NEVER use abstract metaphors or complex phrases (do NOT use 'mechanical lung', 'counteracting', or 'stability animation'). If the text is abstract, choose the single most visually prominent physical noun.
+    Old Segments JSON:
+    {old_segments_json_str}
     
-    --- EXAMPLES OF CLAUSE SEGMENTATION AND SEARCH TERMS ---
+    New Script:
+    {clean_script_text}
+    
+    Your task is to break the NEW script down into distinct visual segments EXACTLY like the old script, but updated for the new text.
+    - If a segment's text has NOT changed, keep its `segment_id` and `envato_search_query` EXACTLY the same, even if it spans multiple clauses.
+    - If a segment's text is slightly modified, update its `voiceover_text`, but try to keep the same `segment_id` and `envato_search_query` if the core visual meaning is the same.
+    - For any completely NEW or heavily modified fragments, break them down into distinct visual segments based on CLAUSES, not sentences. A clause is a grammatical unit containing a subject, verb, and object. If a new sentence has multiple distinct clauses, you MUST break it down into multiple segments (e.g., one segment for "The building collapsed" and another for "and the dust rose into the air"). A single new segment should NEVER exceed one full sentence, and should usually be just one clause. Generate a new 1-2 word `envato_search_query` for each new segment following the old rules.
+    - Also output the theme_word and theme_hex_color as before.
+    
+    --- EXAMPLES OF CLAUSE SEGMENTATION AND SEARCH TERMS FOR NEW FRAGMENTS ---
     Example 1: "The ancient temple was swallowed by the jungle, but its golden spires still gleamed."
     Incorrect (Sentence-level): 1 segment. Search term: "ancient temple jungle". (Too long, multiple clauses).
     Correct (Clause-level):
@@ -280,21 +256,7 @@ def get_script_and_segments():
     Rule for Search Terms: The search term must be a LITERAL, HIGH-QUALITY noun or action that can be easily found on stock video sites. If a clause says "Her heart sank", do NOT search "sinking heart" (abstract). Search something literal like "sad woman" or "dark water".
     --------------------------------------------------------
     
-    Output ONLY a JSON object with this exact structure:
-    {{
-      "theme_word": "The core concept",
-      "theme_hex_color": "FF0000",
-      "segments": [
-        {{
-          "segment_id": "seg_1",
-          "voiceover_text": "the exact text to be spoken",
-          "envato_search_query": "1-2 broad keywords"
-        }}
-      ]
-    }}
-    
-    Script:
-    {clean_script_text}
+    Output ONLY a JSON object with the exact same structure as the Old Segments JSON.
     """
     
     for attempt in range(3):
@@ -755,6 +717,8 @@ def stitch_videos(video_paths, script_hash, master_audio_path=None):
 
     return output_path
 
+import re
+
 def create_ass(segment_durations, theme_word, theme_hex_color, script_hash):
     theme_start = None
     theme_end = None
@@ -975,6 +939,44 @@ def main():
         print("Please set NVIDIA_NIM_API_KEY in the .env file. It is required for script generation.")
         return
 
+    # Prompt user for old hash
+    old_hash_partial = input("Enter the hash key (or partial string) of the previous script to reuse downloads from: ").strip()
+    
+    # Find matching hash
+    downloads_dir = BASE_DOWNLOAD_DIR
+    matching_hashes = []
+    if downloads_dir.exists():
+        for d in downloads_dir.iterdir():
+            if d.is_dir() and old_hash_partial in d.name:
+                matching_hashes.append(d.name)
+                
+    if not matching_hashes:
+        print(f"No matching hash folders found for '{old_hash_partial}' in {downloads_dir}")
+        return
+        
+    old_hash = matching_hashes[0]
+    if len(matching_hashes) > 1:
+        print(f"Multiple matches found: {matching_hashes}. Choosing the first one: {old_hash}")
+    else:
+        print(f"Found match: {old_hash}")
+        
+    old_script_path = f"script_{old_hash}.md"
+    old_segments_path = f"segments_{old_hash}.json"
+    
+    if not os.path.exists(old_script_path):
+        print(f"Error: Could not find old script file {old_script_path}")
+        return
+        
+    if not os.path.exists(old_segments_path):
+        print(f"Error: Could not find old segments file {old_segments_path}")
+        return
+        
+    with open(old_script_path, "r") as f:
+        old_script_text = f.read().strip()
+        
+    with open(old_segments_path, "r") as f:
+        old_segments_data = json.load(f)
+
     # Check and install Whisper for timestamp generation
     whisper_available = check_and_install_whisper()
     if not whisper_available:
@@ -984,7 +986,7 @@ def main():
     if not elevenlabs_available:
         print("⚠️  ELEVENLABS_API_KEY is empty — will use fallback TTS for voiceovers.")
         
-    segments_data = get_script_and_segments()
+    segments_data = get_script_and_segments(old_script_text, old_segments_data)
     if not segments_data: return
     segments, theme_word, theme_hex_color, script_hash, dynamic_subthemes = segments_data
     
@@ -1000,11 +1002,34 @@ def main():
     # Clean up old orphaned tagged directories from previous scripts
     base_dir = Path(".")
     for d in base_dir.glob("theme_images_*"):
-        if d.is_dir() and d.name != f"theme_images_{script_hash}":
+        if d.is_dir() and d.name != f"theme_images_{script_hash}" and d.name != f"theme_images_{old_hash}":
             shutil.rmtree(str(d), ignore_errors=True)
             print(f"Cleaned up old script cache: {d.name}/")
         
     dst_theme_dir.mkdir(exist_ok=True)
+    
+    valid_img_exts = {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif"}
+    
+    old_dst_theme_dir = Path(f"theme_images_{old_hash}")
+    
+    # If the old theme dir exists and we don't have new source images to tag, copy the old ones over
+    if old_dst_theme_dir.exists() and not src_theme_dir.exists():
+        for f in old_dst_theme_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in valid_img_exts:
+                if not (dst_theme_dir / f.name).exists():
+                    shutil.copy2(str(f), str(dst_theme_dir / f.name))
+                    print(f"Reused theme image: {f.name} from {old_hash}")
+                
+        old_subthemes = old_dst_theme_dir / "SubThemes"
+        dst_subthemes = dst_theme_dir / "SubThemes"
+        if old_subthemes.exists():
+            dst_subthemes.mkdir(exist_ok=True)
+            for f in old_subthemes.iterdir():
+                if f.is_file() and f.suffix.lower() in valid_img_exts:
+                    if not (dst_subthemes / f.name).exists():
+                        shutil.copy2(str(f), str(dst_subthemes / f.name))
+                        print(f"Reused SubTheme image: {f.name} from {old_hash}")
+
     
     valid_img_exts = {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".tif"}
     
@@ -1056,6 +1081,8 @@ def main():
                 
         files = [f for f in os.listdir(download_dir) if f.lower().endswith(valid_exts)]
         is_existing_valid = False
+        
+        # Check new dir first
         if files:
             existing_file = download_dir / files[0]
             if is_video_mostly_black(str(existing_file)):
@@ -1077,6 +1104,20 @@ def main():
                     print(f"Video already exists and is valid for {seg_id} -> {video_paths[seg_id]}")
                     is_existing_valid = True
                 
+        # Check old dir if not found in new dir
+        old_download_dir = BASE_DOWNLOAD_DIR / old_hash / seg_id
+        if not is_existing_valid and old_download_dir.exists():
+            old_files = [f for f in os.listdir(old_download_dir) if f.lower().endswith(valid_exts)]
+            if old_files:
+                existing_old_file = old_download_dir / old_files[0]
+                has_motion, drop_ratio = has_high_motion(str(existing_old_file)) if not is_video_mostly_black(str(existing_old_file)) else (False, 1.0)
+                if not is_video_mostly_black(str(existing_old_file)) and not is_video_horizontal(str(existing_old_file)) and has_motion:
+                    video_paths[seg_id] = str(existing_old_file)
+                    print(f"Reusing existing video from {old_hash} for {seg_id} -> {video_paths[seg_id]}")
+                    is_existing_valid = True
+                else:
+                    print(f"   ⚠️  Existing cached video in {old_hash} for {seg_id} is invalid (black, horizontal, or low motion). Will download new.")
+                
         if not is_existing_valid:
             videos_to_download.append(seg)
             
@@ -1085,110 +1126,95 @@ def main():
             downloader.ensure_logged_in()
             unauthorized_attempts = 0
             
-            failed_downloads = videos_to_download.copy()
-            max_retries = 3
-            current_retry = 0
-            
-            while failed_downloads and current_retry <= max_retries:
-                if current_retry > 0:
-                    print(f"\n🔄 Auto-retry pass {current_retry}/{max_retries} for {len(failed_downloads)} failed segments...")
-                    
-                retry_queue = failed_downloads.copy()
-                failed_downloads.clear()
+            i = 0
+            while i < len(videos_to_download):
+                seg = videos_to_download[i]
+                seg_id = seg["segment_id"]
+                query = seg["envato_search_query"]
+                print(f"\n[{i+1}/{len(videos_to_download)}] Searching for {seg_id}: {query}")
                 
-                i = 0
-                while i < len(retry_queue):
-                    seg = retry_queue[i]
-                    seg_id = seg["segment_id"]
-                    query = seg["envato_search_query"]
-                    print(f"\n[{i+1}/{len(retry_queue)}] Searching for {seg_id}: {query}")
-                    
-                    seg_dir = BASE_DOWNLOAD_DIR / script_hash / seg_id
-                    downloader.download_dir = seg_dir
-                    
-                    links = downloader.search_and_get_links(query, 3)
-                    success = False
-                    
-                    if links:
-                        for link_idx, link in enumerate(links):
-                            print(f"   → Trying search result {link_idx + 1}/{len(links)}...")
-                            cache_dir = seg_dir / "temp_cache"
-                            if cache_dir.exists():
-                                shutil.rmtree(str(cache_dir), ignore_errors=True)
-                            cache_dir.mkdir(parents=True, exist_ok=True)
-                            
-                            downloader.download_dir = cache_dir
-                            download_success = downloader.download_item(link_idx + 1, link)
-                            
-                            if download_success == "UNAUTHORIZED":
-                                success = "UNAUTHORIZED"
-                                break
-                            elif download_success:
-                                # Handle zip
-                                downloaded_zips = [f for f in os.listdir(cache_dir) if f.lower().endswith('.zip')]
-                                for zf in downloaded_zips:
-                                    try:
-                                        with zipfile.ZipFile(cache_dir / zf, 'r') as z: z.extractall(cache_dir)
-                                        os.remove(cache_dir / zf)
-                                    except: pass
-                                
-                                files = [f for f in os.listdir(cache_dir) if f.lower().endswith(valid_exts)]
-                                if files:
-                                    candidate = cache_dir / files[0]
-                                    if is_video_mostly_black(str(candidate)) or is_video_horizontal(str(candidate)):
-                                        os.remove(candidate)
-                                    else:
-                                        has_motion, drop_ratio = has_high_motion(str(candidate))
-                                        cache_name = f"cached_{drop_ratio:.2f}_{candidate.name}"
-                                        os.rename(candidate, cache_dir / cache_name)
-                                        if has_motion:
-                                            shutil.move(str(cache_dir / cache_name), str(seg_dir / candidate.name))
-                                            shutil.rmtree(str(cache_dir), ignore_errors=True)
-                                            video_paths[seg_id] = str(seg_dir / candidate.name)
-                                            success = True
-                                            break
-                                            
-                        if success == "UNAUTHORIZED":
-                            unauthorized_attempts += 1
-                            if unauthorized_attempts == 1:
-                                print("\n" + "!" * 60 + "\n [Recovery Mode 1] Log in to Envato. Will auto-retry in 5 mins.\n" + "!" * 60)
-                                timed_input("Press Enter to retry now... ", 300)
-                            elif unauthorized_attempts == 2:
-                                print("\n" + "!" * 60 + "\n [Recovery Mode 2] Log in to Envato. Will auto-retry in 5 mins.\n" + "!" * 60)
-                                timed_input("Press Enter to retry now... ", 300)
-                            else:
-                                print("\n" + "!" * 60 + "\n [Final Recovery] Please log in. I will wait indefinitely.\n" + "!" * 60)
-                                input("Press Enter to retry... ")
-                            continue
-                            
-                        if not success:
-                            cache_dir = seg_dir / "temp_cache"
-                            if cache_dir.exists():
-                                cached_files = [f for f in os.listdir(cache_dir) if f.startswith("cached_")]
-                                if cached_files:
-                                    cached_files.sort(key=lambda x: float(x.split('_')[1]))
-                                    best_fallback = cached_files[0]
-                                    fallback_ratio = float(best_fallback.split('_')[1])
-                                    original_name = best_fallback.split('_', 2)[2]
-                                    shutil.move(str(cache_dir / best_fallback), str(seg_dir / original_name))
-                                    print(f"   ⚠️  All links had low motion. Falling back to best (Drop ratio: {fallback_ratio:.2f}): {original_name}")
-                                    video_paths[seg_id] = str(seg_dir / original_name)
-                                    success = True
-                                shutil.rmtree(str(cache_dir), ignore_errors=True)
-                            
-                    if not success:
-                        print(f"   ❌ Download failed for all links for {seg_id}. Adding to retry queue.")
-                        failed_downloads.append(seg)
+                seg_dir = BASE_DOWNLOAD_DIR / script_hash / seg_id
+                downloader.download_dir = seg_dir
+                
+                links = downloader.search_and_get_links(query, 3)
+                success = False
+                
+                if links:
+                    for link_idx, link in enumerate(links):
+                        print(f"   → Trying search result {link_idx + 1}/{len(links)}...")
+                        cache_dir = seg_dir / "temp_cache"
+                        if cache_dir.exists():
+                            shutil.rmtree(str(cache_dir), ignore_errors=True)
+                        cache_dir.mkdir(parents=True, exist_ok=True)
                         
-                    unauthorized_attempts = 0
-                    i += 1
-                    human_delay(3, 5)
+                        downloader.download_dir = cache_dir
+                        download_success = downloader.download_item(link_idx + 1, link)
+                        
+                        if download_success == "UNAUTHORIZED":
+                            success = "UNAUTHORIZED"
+                            break
+                        elif download_success:
+                            # Handle zip
+                            downloaded_zips = [f for f in os.listdir(cache_dir) if f.lower().endswith('.zip')]
+                            for zf in downloaded_zips:
+                                try:
+                                    with zipfile.ZipFile(cache_dir / zf, 'r') as z: z.extractall(cache_dir)
+                                    os.remove(cache_dir / zf)
+                                except: pass
+                            
+                            files = [f for f in os.listdir(cache_dir) if f.lower().endswith(valid_exts)]
+                            if files:
+                                candidate = cache_dir / files[0]
+                                if is_video_mostly_black(str(candidate)) or is_video_horizontal(str(candidate)):
+                                    os.remove(candidate)
+                                else:
+                                    has_motion, drop_ratio = has_high_motion(str(candidate))
+                                    cache_name = f"cached_{drop_ratio:.2f}_{candidate.name}"
+                                    os.rename(candidate, cache_dir / cache_name)
+                                    if has_motion:
+                                        shutil.move(str(cache_dir / cache_name), str(seg_dir / candidate.name))
+                                            shutil.rmtree(str(cache_dir), ignore_errors=True)
+                                            print(f"   ✅ Valid vertical video downloaded successfully: {final_path.name}")
+                                        shutil.rmtree(str(cache_dir), ignore_errors=True)
+                                        video_paths[seg_id] = str(seg_dir / candidate.name)
+                                        success = True
+                                        break
+                                        
+                    if success == "UNAUTHORIZED":
+                        unauthorized_attempts += 1
+                        if unauthorized_attempts == 1:
+                            print("\n" + "!" * 60 + "\n [Recovery Mode 1] Log in to Envato. Will auto-retry in 5 mins.\n" + "!" * 60)
+                            timed_input("Press Enter to retry now... ", 300)
+                        elif unauthorized_attempts == 2:
+                            print("\n" + "!" * 60 + "\n [Recovery Mode 2] Log in to Envato. Will auto-retry in 5 mins.\n" + "!" * 60)
+                            timed_input("Press Enter to retry now... ", 300)
+                        else:
+                            print("\n" + "!" * 60 + "\n [Final Recovery] Please log in. I will wait indefinitely.\n" + "!" * 60)
+                            input("Press Enter to retry... ")
+                        continue
+                        
+                    if not success:
+                        cache_dir = seg_dir / "temp_cache"
+                        if cache_dir.exists():
+                            cached_files = [f for f in os.listdir(cache_dir) if f.startswith("cached_")]
+                            if cached_files:
+                                cached_files.sort(key=lambda x: float(x.split('_')[1]))
+                                best_fallback = cached_files[0]
+                                fallback_ratio = float(best_fallback.split('_')[1])
+                                original_name = best_fallback.split('_', 2)[2]
+                                shutil.move(str(cache_dir / best_fallback), str(seg_dir / original_name))
+                                print(f"   ⚠️  All links had low motion. Falling back to best (Drop ratio: {fallback_ratio:.2f}): {original_name}")
+                                video_paths[seg_id] = str(seg_dir / original_name)
+                                success = True
+                            shutil.rmtree(str(cache_dir), ignore_errors=True)
+                        
+                if not success:
+                    print(f"\n❌ ERROR: Failed to download ANY valid video for segment {seg_id}.")
+                    sys.exit(1)
                     
-                current_retry += 1
-                
-            if failed_downloads:
-                print(f"\n❌ ERROR: Failed to download {len(failed_downloads)} segments after {max_retries} retries.")
-                sys.exit(1)
+                unauthorized_attempts = 0
+                i += 1
+                human_delay(3, 5)
             
     # Check if all videos are present
     missing_videos = [s for s in segments if s["segment_id"] not in video_paths]
