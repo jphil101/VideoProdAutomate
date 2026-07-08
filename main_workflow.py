@@ -250,63 +250,85 @@ def get_script_and_segments():
         except Exception as e:
             print(f"Error checking cache: {e}")
             
-    segment_prompt = f"""
-    You are a video editor. Break the following script down into distinct visual segments based on CLAUSES, not sentences.
-    A clause is a grammatical unit containing a subject, verb, and object.
-    If a sentence has multiple distinct clauses (e.g., "The building collapsed, and the dust rose into the air"), you MUST break it down into multiple segments (e.g., one segment for "The building collapsed" and another for "and the dust rose into the air").
-    A single segment should NEVER exceed one full sentence, and should usually be just one clause. Each segment will get its own search term.
+    # Count sentences to set a target for segments
+    sentence_count = len([s for s in clean_script_text.replace('?', '.').replace('!', '.').split('.') if s.strip()])
+    min_segments = sentence_count  # Aim for roughly 1-2 segments per sentence
     
-    You must also identify ONE primary theme concept (1-3 words max) that is the absolute core subject of the video. 
-    The theme_word MUST be an exact substring of the script text.
-    You must also select a vibrant Hex color code (6 characters, no #) that matches this theme.
-    
-    CRITICAL INSTRUCTION FOR SEARCH QUERIES: 
-    The 'envato_search_query' MUST BE EXACTLY 1 TO 2 WORDS MAX.
-    It MUST be extremely generic and literal (e.g. 'skyscraper', 'wind', 'glass', 'gears').
-    NEVER use abstract metaphors or complex phrases (do NOT use 'mechanical lung', 'counteracting', or 'stability animation'). If the text is abstract, choose the single most visually prominent physical noun.
-    
-    --- EXAMPLES OF CLAUSE SEGMENTATION AND SEARCH TERMS ---
-    Example 1: "The ancient temple was swallowed by the jungle, but its golden spires still gleamed."
-    Incorrect (Sentence-level): 1 segment. Search term: "ancient temple jungle". (Too long, multiple clauses).
-    Correct (Clause-level):
-      - Segment 1: "The ancient temple was swallowed by the jungle," (Search term: "jungle ruins")
-      - Segment 2: "but its golden spires still gleamed." (Search term: "gold temple")
-      
-    Example 2: "He sprinted across the bridge as it collapsed behind him."
-    Correct (Clause-level):
-      - Segment 1: "He sprinted across the bridge" (Search term: "running man")
-      - Segment 2: "as it collapsed behind him." (Search term: "falling bridge")
-      
-    Rule for Search Terms: The search term must be a LITERAL, HIGH-QUALITY noun or action that can be easily found on stock video sites. If a clause says "Her heart sank", do NOT search "sinking heart" (abstract). Search something literal like "sad woman" or "dark water".
-    --------------------------------------------------------
-    
-    Output ONLY a JSON object with this exact structure:
+    segment_prompt = f"""You are a B-roll video editor. Your job is to break a script into visual segments so each one gets a unique, visually distinct stock video clip.
+
+=== SEGMENTATION RULES (MANDATORY) ===
+1. The unit of segmentation is the CLAUSE, NOT the sentence. A clause = subject + verb (+ optional object).
+2. If a sentence contains 2+ distinct clauses (e.g., joined by "and", "but"), you SHOULD split it into separate segments if they represent different visual ideas.
+3. A segment should ideally not exceed ~15-20 words.
+4. You MUST produce AT LEAST {min_segments} segments (roughly 1 to 1.5 segments per sentence).
+5. IGNORE IDIOMS: If a segment is purely figurative (e.g., "it's about time", "the dust has settled"), DO NOT create a literal search for it (like "clock" or "dust"). Combine it with an adjacent clause or search for the overarching theme.
+
+=== SEARCH QUERY RULES (MANDATORY) ===
+1. Each envato_search_query MUST be EXACTLY 2 WORDS. Not 1 word, not 3 words. Exactly 2.
+2. The 2 words must be a LITERAL, CONCRETE, VISUAL noun phrase that a stock video site would have footage of.
+3. INHERIT CONTEXT: If a clause uses a generic word (e.g., "application is faster"), you MUST inherit the main subject (e.g., "drywall application", NOT "construction site").
+4. AVOID AMBIGUITY: If a phrase could have an unrelated meaning (e.g., "cracked joints" -> medical), you MUST anchor it to the main topic (e.g., "cracked drywall").
+5. GOOD examples: "mixing plaster", "cracked drywall", "cement truck", "drywall application", "construction worker"
+6. BAD examples (too vague/ambiguous): "water", "cracked joints", "clock", "application", "construction site"
+
+=== FEW-SHOT EXAMPLE ===
+INPUT: "Workers have been mixing cement by hand for decades, but the result is cracked joints and toxic dust."
+WRONG (ambiguous/vague):
+  seg_1: "Workers have been mixing cement by hand for decades," → "mixing cement"
+  seg_2: "but the result is cracked joints" → "cracked joints" (will yield medical videos!)
+CORRECT (contextualized 2-word keywords):
+  seg_1: "Workers have been mixing cement by hand for decades," → "mixing plaster"
+  seg_2: "but the result is cracked joints" → "cracked drywall"
+  seg_3: "and toxic dust." → "construction dust"
+
+=== THEME ===
+Identify ONE primary theme concept (1-3 words max) that is the absolute core material/subject of the video (e.g., "drywall", "concrete").
+DO NOT select generic settings like "construction sites" or "building".
+The theme_word MUST be an exact substring of the script text (case-insensitive match is fine).
+Also select a vibrant Hex color code (6 characters, no #) that matches this theme.
+
+=== OUTPUT FORMAT ===
+Output ONLY a JSON object:
+{{
+  "theme_word": "core concept",
+  "theme_hex_color": "FF6600",
+  "segments": [
     {{
-      "theme_word": "The core concept",
-      "theme_hex_color": "FF0000",
-      "segments": [
-        {{
-          "segment_id": "seg_1",
-          "voiceover_text": "the exact text to be spoken",
-          "envato_search_query": "1-2 broad keywords"
-        }}
-      ]
+      "segment_id": "seg_1",
+      "voiceover_text": "exact clause text from script",
+      "envato_search_query": "two words"
     }}
+  ]
+}}
+
+REMEMBER: At least {min_segments} segments. Every query must be EXACTLY 2 words. Split aggressively on clauses and list items.
+
+Script:
+{clean_script_text}
+"""
     
-    Script:
-    {clean_script_text}
-    """
+    models_to_try = [
+        "openai/gpt-oss-120b",
+        "nvidia/nemotron-3-super-120b-a12b",
+        "meta/llama-3.1-70b-instruct"
+    ]
     
     for attempt in range(3):
         try:
+            model_to_use = models_to_try[attempt]
+            print(f"   Calling NIM API with model: {model_to_use}...")
             response = nim_client.chat.completions.create(
-                model="openai/gpt-oss-120b",
+                model=model_to_use,
                 messages=[{"role": "user", "content": segment_prompt}],
                 max_tokens=2048,
-                response_format={"type": "json_object"} # Try to enforce JSON if supported, otherwise rely on prompt
+                temperature=0.2
             )
             
-            content = response.choices[0].message.content.strip()
+            raw_content = response.choices[0].message.content
+            if raw_content is None:
+                raise ValueError(f"API returned None for content with model {model_to_use}.")
+            
+            content = raw_content.strip()
             
             # Try to parse JSON. Sometimes LLMs wrap in ```json
             if content.startswith("```json"):
@@ -318,6 +340,26 @@ def get_script_and_segments():
             segments = data.get("segments", [])
             theme_word = data.get("theme_word", "Concept")
             theme_hex_color = data.get("theme_hex_color", "00FFFF")
+            
+            # Post-LLM validation: enforce 2-word search queries
+            for seg in segments:
+                query = seg.get("envato_search_query", "").strip()
+                words = query.split()
+                if len(words) == 1:
+                    # Pad single-word queries with a contextual word from the voiceover text
+                    voiceover = seg.get("voiceover_text", "")
+                    # Find a concrete noun from the voiceover that isn't the query itself
+                    candidates = [w.strip('.,!?;:()"\'-') for w in voiceover.split() 
+                                  if len(w.strip('.,!?;:()"\'-')) > 3 and w.strip('.,!?;:()"\'-').lower() != query.lower()]
+                    if candidates:
+                        seg["envato_search_query"] = f"{query} {candidates[0]}"
+                    print(f"   ⚠️  Padded 1-word query '{query}' → '{seg['envato_search_query']}'")
+                elif len(words) > 2:
+                    # Truncate to first 2 words
+                    seg["envato_search_query"] = " ".join(words[:2])
+                    print(f"   ⚠️  Truncated query '{query}' → '{seg['envato_search_query']}'")
+            
+            print(f"   ✅ LLM returned {len(segments)} segments (minimum target was {min_segments})")
                 
             # Deterministic Validation: Ensure theme_word is exactly in the script
             if theme_word.lower() not in clean_script_text.lower():
@@ -348,7 +390,10 @@ def get_script_and_segments():
             print(f"Attempt {attempt+1} failed to parse JSON. Retrying...")
             if attempt == 2:
                 print("Final attempt failed. Raw output:")
-                print(content)
+                try:
+                    print(raw_content)
+                except NameError:
+                    print("No content received.")
                 raise e
 
 def generate_voiceover_api(text, audio_path):
@@ -502,40 +547,48 @@ def is_video_horizontal(filepath):
 
 def has_high_motion(filepath):
     """
-    Checks if a video has sufficient motion using FFmpeg's mpdecimate filter.
-    Returns (has_motion_bool, drop_ratio)
+    Checks if a video has sufficient motion using FFmpeg's freezedetect filter.
+    freezedetect is more reliable than mpdecimate across ffmpeg versions.
+    Returns (has_motion_bool, freeze_fraction) where freeze_fraction is 0.0-1.0
+    representing the proportion of the video that is frozen.
     """
     if not os.path.exists(filepath):
         return (False, 1.0)
     try:
+        # Get video duration first
+        dur_cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0", filepath
+        ]
+        duration = float(subprocess.check_output(dur_cmd).decode().strip())
+        if duration <= 0:
+            return (False, 1.0)
+        
+        # Run freezedetect: n=0.003 is noise threshold, d=0.5 means freeze periods >= 0.5s
         cmd = [
             "ffmpeg", "-i", filepath,
-            "-vf", "mpdecimate=hi=200:lo=100:frac=0.1",
-            "-loglevel", "debug",
+            "-vf", "freezedetect=n=0.003:d=0.5",
             "-f", "null", "-"
         ]
-        process = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, universal_newlines=True)
-        drop_count = 0
-        keep_count = 0
-        for line in process.stderr:
-            if "Parsed_mpdecimate" in line:
-                if "drop" in line:
-                    drop_count += 1
-                elif "keep" in line:
-                    keep_count += 1
+        result = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
         
-        process.wait()
-        total = drop_count + keep_count
-        if total == 0:
-            return (True, 0.0)
+        # Parse freeze_duration lines to sum total frozen time
+        import re as _re
+        total_frozen = 0.0
+        for line in result.stderr.split('\n'):
+            # Match lines like: lavfi.freezedetect.freeze_duration: 5.000000
+            m = _re.search(r'freeze_duration:\s*([\d.]+)', line)
+            if m:
+                total_frozen += float(m.group(1))
+        
+        freeze_fraction = total_frozen / duration
+        if freeze_fraction > 0.50:
+            print(f"   [Motion Check] Video is mostly frozen ({freeze_fraction:.0%} frozen).")
+            return (False, freeze_fraction)
             
-        drop_ratio = drop_count / total
-        if drop_ratio > 0.60:
-            print(f"   [Motion Check] Video has very low motion (Drop ratio: {drop_ratio:.2f}).")
-            return (False, drop_ratio)
-            
-        print(f"   [Motion Check] Video has good motion (Drop ratio: {drop_ratio:.2f}).")
-        return (True, drop_ratio)
+        print(f"   [Motion Check] Video has good motion ({freeze_fraction:.0%} frozen).")
+        return (True, freeze_fraction)
     except Exception as e:
         print(f"Error checking motion for {filepath}: {e}")
         return (True, 0.0)
@@ -970,6 +1023,50 @@ def generate_and_burn_subtitles(video_path, theme_word, theme_hex_color, theme_s
         print(f"Could not burn subtitles. Error: {e}")
         os.rename(video_path, output_path)
 
+def rank_video_results(voiceover, links):
+    """Uses the LLM to rank the video search results based on their titles."""
+    if len(links) <= 1:
+        return links
+        
+    prompt = f"""You are an expert video editor. I have a voiceover segment: "{voiceover}"
+I searched for B-roll and found the following videos:
+"""
+    for i, link in enumerate(links):
+        prompt += f"\nTitle {i+1}: {link['title']}"
+        
+    prompt += """\n
+Rank these videos from most relevant to least relevant to the voiceover.
+Consider that some titles might be ambiguous or completely unrelated (e.g. medical vs construction).
+Output ONLY a comma-separated list of the numbers representing your ranking (e.g., '2, 1, 3' or '3, 2, 1').
+"""
+    try:
+        response = nim_client.chat.completions.create(
+            model="meta/llama-3.1-70b-instruct",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=20,
+            temperature=0.1
+        )
+        content = response.choices[0].message.content.strip()
+        print(f"   [LLM Ranking] Assessing titles against voiceover: '{voiceover}'")
+        for i, link in enumerate(links):
+            print(f"      {i+1}. {link['title']}")
+        print(f"   [LLM Ranking] Chosen Order: {content}")
+        
+        import re
+        indices = [int(idx) for idx in re.findall(r'\d+', content)]
+        valid_indices = [idx - 1 for idx in indices if 1 <= idx <= len(links)]
+        
+        # Add any missing indices
+        for i in range(len(links)):
+            if i not in valid_indices:
+                valid_indices.append(i)
+                
+        ranked_links = [links[i] for i in valid_indices[:len(links)]]
+        return ranked_links
+    except Exception as e:
+        print(f"   ⚠️  Failed to rank videos via LLM: {e}. Falling back to default order.")
+        return links
+
 def main():
     if not NVIDIA_NIM_API_KEY:
         print("Please set NVIDIA_NIM_API_KEY in the .env file. It is required for script generation.")
@@ -1081,7 +1178,7 @@ def main():
             videos_to_download.append(seg)
             
     if videos_to_download:
-        with EnvatoElementsDownloader(media_type="video", headless=False) as downloader:
+        with EnvatoElementsDownloader(download_dir=BASE_DOWNLOAD_DIR, media_type="video", headless=False) as downloader:
             downloader.ensure_logged_in()
             unauthorized_attempts = 0
             
@@ -1107,18 +1204,23 @@ def main():
                     downloader.download_dir = seg_dir
                     
                     links = downloader.search_and_get_links(query, 3)
+                    
+                    if links:
+                        links = rank_video_results(seg.get("voiceover_text", query), links)
+                        
                     success = False
                     
                     if links:
-                        for link_idx, link in enumerate(links):
+                        # Create cache dir once before the link loop so cached files accumulate
+                        cache_dir = seg_dir / "temp_cache"
+                        if cache_dir.exists():
+                            shutil.rmtree(str(cache_dir), ignore_errors=True)
+                        cache_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        for link_idx, link_obj in enumerate(links):
                             print(f"   → Trying search result {link_idx + 1}/{len(links)}...")
-                            cache_dir = seg_dir / "temp_cache"
-                            if cache_dir.exists():
-                                shutil.rmtree(str(cache_dir), ignore_errors=True)
-                            cache_dir.mkdir(parents=True, exist_ok=True)
-                            
                             downloader.download_dir = cache_dir
-                            download_success = downloader.download_item(link_idx + 1, link)
+                            download_success = downloader.download_item(link_idx + 1, link_obj["url"])
                             
                             if download_success == "UNAUTHORIZED":
                                 success = "UNAUTHORIZED"
@@ -1132,15 +1234,16 @@ def main():
                                         os.remove(cache_dir / zf)
                                     except: pass
                                 
-                                files = [f for f in os.listdir(cache_dir) if f.lower().endswith(valid_exts)]
+                                files = [f for f in os.listdir(cache_dir) if f.lower().endswith(valid_exts) and not f.startswith('cached_')]
                                 if files:
                                     candidate = cache_dir / files[0]
                                     if is_video_mostly_black(str(candidate)) or is_video_horizontal(str(candidate)):
                                         os.remove(candidate)
                                     else:
-                                        has_motion, drop_ratio = has_high_motion(str(candidate))
-                                        cache_name = f"cached_{drop_ratio:.2f}_{candidate.name}"
-                                        os.rename(candidate, cache_dir / cache_name)
+                                        has_motion, freeze_frac = has_high_motion(str(candidate))
+                                        # Rename with index prefix so fallback prefers first-downloaded
+                                        cache_name = f"cached_{link_idx}_{freeze_frac:.4f}_{candidate.name}"
+                                        os.rename(str(candidate), str(cache_dir / cache_name))
                                         if has_motion:
                                             shutil.move(str(cache_dir / cache_name), str(seg_dir / candidate.name))
                                             shutil.rmtree(str(cache_dir), ignore_errors=True)
@@ -1166,12 +1269,15 @@ def main():
                             if cache_dir.exists():
                                 cached_files = [f for f in os.listdir(cache_dir) if f.startswith("cached_")]
                                 if cached_files:
-                                    cached_files.sort(key=lambda x: float(x.split('_')[1]))
+                                    # Sort by (freeze_fraction ASC, index ASC) to prefer most motion, then earliest downloaded
+                                    # Format: cached_{index}_{freeze_frac}_{original_name}
+                                    cached_files.sort(key=lambda x: (float(x.split('_')[2]), int(x.split('_')[1])))
                                     best_fallback = cached_files[0]
-                                    fallback_ratio = float(best_fallback.split('_')[1])
-                                    original_name = best_fallback.split('_', 2)[2]
+                                    parts = best_fallback.split('_', 3)  # ['cached', index, freeze_frac, original_name]
+                                    freeze_frac = float(parts[2])
+                                    original_name = parts[3]
                                     shutil.move(str(cache_dir / best_fallback), str(seg_dir / original_name))
-                                    print(f"   ⚠️  All links had low motion. Falling back to best (Drop ratio: {fallback_ratio:.2f}): {original_name}")
+                                    print(f"   ⚠️  All links had low motion. Falling back to best ({freeze_frac:.0%} frozen): {original_name}")
                                     video_paths[seg_id] = str(seg_dir / original_name)
                                     success = True
                                 shutil.rmtree(str(cache_dir), ignore_errors=True)

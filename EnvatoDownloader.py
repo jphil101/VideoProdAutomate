@@ -99,6 +99,14 @@ class EnvatoElementsDownloader:
         self.download_dir = download_dir
         self.media_type = media_type
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        return False
+
     def start(self):
         """Launch the stealth browser with persistent session."""
         print(f"🚀 Preparing local cache for browser profile...")
@@ -190,6 +198,8 @@ class EnvatoElementsDownloader:
         """Check if logged in, otherwise pause for manual login."""
         self.page.goto("https://app.envato.com/", wait_until="domcontentloaded")
         self.handle_cookie_consent()
+        # Give the page time to fully render dynamic elements (avatar, sign-in button)
+        human_delay(3, 5)
         
         print("🔍 Checking Envato login status...")
         try:
@@ -241,7 +251,7 @@ class EnvatoElementsDownloader:
         self.page.mouse.wheel(0, 500)
         human_delay(1, 2)
 
-        links = []
+        links_data = []
         try:
             if self.media_type == "photo":
                 valid_substrings = ["photo", "image", "picture"]
@@ -257,25 +267,45 @@ class EnvatoElementsDownloader:
                 if href:
                     # Filter for item page URLs containing the 7-12 character uppercase ID pattern or UUIDv4 pattern
                     if re.search(r"-[A-Z0-9]{7,12}(?:[/?]|$)|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", href):
-                        if href not in links:
-                            links.append(href)
-                            if len(links) >= count:
+                        if not any(d['raw_url'] == href for d in links_data):
+                            title = el.get_attribute("aria-label")
+                            if not title:
+                                try:
+                                    title = el.locator("img").first.get_attribute("alt")
+                                except:
+                                    pass
+                            if not title:
+                                try:
+                                    title = el.inner_text().strip().split('\n')[0]
+                                except:
+                                    pass
+                            if not title:
+                                title = "Unknown Title"
+                                
+                            links_data.append({"raw_url": href, "title": title.strip()})
+                            if len(links_data) >= count:
                                 break
         except TimeoutError:
             print(f"⚠️  No {self.media_type} results found or page structure changed.")
 
         # Ensure absolute URLs and bypass the modal overlay
         absolute_links = []
-        for link in links:
+        for item in links_data:
+            link = item["raw_url"]
             # If the link opens the modal overlay (e.g. /search/all/stock-video/...)
             # we strip out the search part to get the standalone item page URL
             clean_link = link.replace("/search/all/", "/")
             clean_link = clean_link.split("?")[0] # remove search tracking parameters
             
             if clean_link.startswith("http"):
-                absolute_links.append(clean_link)
+                abs_url = clean_link
             else:
-                absolute_links.append(f"https://app.envato.com{clean_link}")
+                abs_url = f"https://app.envato.com{clean_link}"
+                
+            absolute_links.append({
+                "url": abs_url,
+                "title": item["title"]
+            })
                 
         print(f"✅ Found {len(absolute_links)} {self.media_type} links.")
         return absolute_links
@@ -313,7 +343,7 @@ class EnvatoElementsDownloader:
             print("   ⏳ Triggering download... (waiting up to 60s for server)")
             with self.page.expect_download(timeout=60000) as download_info:
                 print("   🖱️  Clicking Download button...")
-                download_btn.click()
+                download_btn.click(force=True)
                 
                 project_dialog = self.page.locator("button:visible", has_text=re.compile(r"(Add.*Download|Download without license)", re.IGNORECASE)).first
                 try:
