@@ -386,6 +386,80 @@ class EnvatoElementsDownloader:
             print(f"   ❌ Error during download: {e}")
             return False
 
+    def trigger_download(self, index: int, item_url: str):
+        """Navigate to an item page and trigger download, returning the Download object without waiting for it to finish."""
+        print(f"\n── Result {index}: {item_url}")
+        self.page.goto(item_url, wait_until="domcontentloaded")
+        self.handle_cookie_consent()
+        human_delay(2, 4)
+
+        title = f"{self.media_type}_item"
+        try:
+            title_el = self.page.locator("h1").first
+            if title_el.is_visible():
+                title = title_el.inner_text()
+        except:
+            pass
+
+        base_filename = f"{index}_{sanitize_filename(title)}"
+        
+        download_btn = self.page.locator("button:visible", has_text=re.compile(r"\bDownload\b", re.IGNORECASE)).first
+        try:
+            download_btn.wait_for(state="visible", timeout=30000)
+        except TimeoutError:
+            print("   ❌ 'Download' button not found after waiting.")
+            return "UNAUTHORIZED"
+
+        try:
+            print("   ⏳ Triggering download... (streaming in background)")
+            with self.page.expect_download(timeout=60000) as download_info:
+                print("   🖱️  Clicking Download button...")
+                download_btn.click(force=True)
+                
+                project_dialog = self.page.locator("button:visible", has_text=re.compile(r"(Add.*Download|Download without license)", re.IGNORECASE)).first
+                try:
+                    if project_dialog.wait_for(state="visible", timeout=6000):
+                        print("   📝 License dialog detected. Confirming download...")
+                        project_dialog.click()
+                except TimeoutError:
+                    pass
+                    
+                try:
+                    self.page.evaluate("document.querySelectorAll('video').forEach(v => v.pause());")
+                except:
+                    pass
+                    
+            download = download_info.value
+            
+            original_filename = download.suggested_filename
+            ext = os.path.splitext(original_filename)[1]
+            if not ext:
+                ext = ".mp4" if self.media_type == "video" else ".jpg"
+                
+            final_filename = f"{base_filename}{ext}"
+            filepath = self.download_dir / final_filename
+            
+            return {"download_obj": download, "filepath": filepath, "final_filename": final_filename}
+            
+        except TimeoutError:
+            print("   ❌ Download did not start within the timeout.")
+            return False
+        except Exception as e:
+            print(f"   ❌ Error during download trigger: {e}")
+            return False
+
+    def wait_and_save_download(self, download_obj, filepath):
+        """Blocks to save a previously triggered download to disk."""
+        print(f"   ⬇️  Saving background download to {filepath.name}...")
+        try:
+            download_obj.save_as(filepath)
+            size_mb = filepath.stat().st_size / (1024 * 1024)
+            print(f"   ✅ Saved {size_mb:.1f} MB to {filepath}")
+            return True
+        except Exception as e:
+            print(f"   ❌ Error saving download: {e}")
+            return False
+
 
 def main():
     parser = argparse.ArgumentParser(description="Envato Elements CloakBrowser Downloader")

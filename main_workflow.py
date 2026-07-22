@@ -189,11 +189,24 @@ def check_and_install_whisper():
         print(f"   ❌ Failed to install faster-whisper: {e}")
         return False
 
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
 # Initialize NIM client
 nim_client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=NVIDIA_NIM_API_KEY
 )
+
+# Initialize OpenRouter client
+openrouter_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY
+) if OPENROUTER_API_KEY else None
+
+def get_llm_client(provider):
+    if provider == "nvidia": return nim_client
+    if provider == "openrouter": return openrouter_client
+    return None
 
 def get_script_and_segments():
     print("Step 1: Topic & Script Generation")
@@ -212,9 +225,12 @@ def get_script_and_segments():
         response = nim_client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024
+            max_tokens=4096
         )
-        script_text = response.choices[0].message.content.strip()
+        raw = response.choices[0].message.content
+        if not raw:
+            raw = getattr(response.choices[0].message, 'reasoning_content', None) or ""
+        script_text = raw.strip()
         with open("CurrentScript.md", "w") as f:
             f.write(script_text)
         print("Generated and saved script to CurrentScript.md")
@@ -257,29 +273,45 @@ def get_script_and_segments():
     segment_prompt = f"""You are a B-roll video editor. Your job is to break a script into visual segments so each one gets a unique, visually distinct stock video clip.
 
 === SEGMENTATION RULES (MANDATORY) ===
-1. The unit of segmentation is the CLAUSE, NOT the sentence. A clause = subject + verb (+ optional object).
-2. If a sentence contains 2+ distinct clauses (e.g., joined by "and", "but"), you SHOULD split it into separate segments if they represent different visual ideas.
-3. A segment should ideally not exceed ~15-20 words.
-4. You MUST produce AT LEAST {min_segments} segments (roughly 1 to 1.5 segments per sentence).
-5. IGNORE IDIOMS: If a segment is purely figurative (e.g., "it's about time", "the dust has settled"), DO NOT create a literal search for it (like "clock" or "dust"). Combine it with an adjacent clause or search for the overarching theme.
+1. The unit of segmentation is the CLAUSE. Split compound sentences (e.g. joined by "and", "but") if they represent distinct visual actions.
+2. COMBINE FLUFF (CRITICAL): Micro-phrases that are purely rhetorical or conversational MUST be merged with the nearest meaningful sentence. NEVER create a standalone segment for: "And honestly?", "It's about time.", "The result?", "Let me explain.", "Here's the thing.", or any other phrase under 5 words that has no standalone visual meaning.
+3. Target number of segments: ~{min_segments} (approx 1 per sentence on average). Do not over-segment filler, but do not under-segment action sequences.
+4. CTA segments ("Let us know in the comments!", "Subscribe!", "Follow for more!") should use a search query that visualizes ENGAGEMENT, not social media icons. E.g. "audience watching" or "person commenting".
 
 === SEARCH QUERY RULES (MANDATORY) ===
 1. Each envato_search_query MUST be EXACTLY 2 WORDS. Not 1 word, not 3 words. Exactly 2.
 2. The 2 words must be a LITERAL, CONCRETE, VISUAL noun phrase that a stock video site would have footage of.
-3. INHERIT CONTEXT: If a clause uses a generic word (e.g., "application is faster"), you MUST inherit the main subject (e.g., "drywall application", NOT "construction site").
-4. AVOID AMBIGUITY: If a phrase could have an unrelated meaning (e.g., "cracked joints" -> medical), you MUST anchor it to the main topic (e.g., "cracked drywall").
-5. GOOD examples: "mixing plaster", "cracked drywall", "cement truck", "drywall application", "construction worker"
-6. BAD examples (too vague/ambiguous): "water", "cracked joints", "clock", "application", "construction site"
+3. INHERIT CONTEXT & IGNORE IDIOMS: If a segment is purely figurative (e.g., "it's about time", "elephant in the room", "breath of fresh air") DO NOT search for literal clocks, elephants, or wind. Instead, infer what is actually being discussed (e.g., "drywall renovation", "construction planning") and use that.
+4. AVOID AMBIGUITY (CRITICAL): If a word has multiple meanings (e.g., "application" -> software app vs applying drywall, "network" -> internet vs networking event, "joints" -> smoking/medical vs drywall joints), you MUST use the physical/topical word instead. Never use "application" for a physical process.
+5. NEVER USE GENERIC TERMS: Do NOT use vague terms like "construction site", "social media", "thoughtful worker", "application", or "water". BE SPECIFIC (e.g., "drywall construction", "pouring concrete").
+6. GOOD examples: "mixing plaster", "cracked drywall", "cement truck", "drywall construction", "construction worker"
+7. BAD examples: "water", "cracked joints", "clock", "application", "fast application", "construction site", "social media", "thoughtful worker"
 
-=== FEW-SHOT EXAMPLE ===
-INPUT: "Workers have been mixing cement by hand for decades, but the result is cracked joints and toxic dust."
-WRONG (ambiguous/vague):
-  seg_1: "Workers have been mixing cement by hand for decades," → "mixing cement"
-  seg_2: "but the result is cracked joints" → "cracked joints" (will yield medical videos!)
-CORRECT (contextualized 2-word keywords):
-  seg_1: "Workers have been mixing cement by hand for decades," → "mixing plaster"
+=== FEW-SHOT EXAMPLES ===
+EXAMPLE 1 (Combining micro-phrases with adjacent sentence):
+INPUT: "Dry powder is officially dying on construction sites. And honestly? It's about time."
+WRONG - creates 3 segments, floats micro-phrases alone:
+  seg_1: "Dry powder is officially dying on construction sites." → "drywall powder"
+  seg_2: "And honestly?" → "construction worker" (WRONG! Standalone micro-phrase!)
+  seg_3: "It's about time." → "drywall renovation" (WRONG! Standalone micro-phrase!)
+CORRECT - merges them all:
+  seg_1: "Dry powder is officially dying on construction sites. And honestly? It's about time." → "drywall powder"
+
+EXAMPLE 2 (Construction Theme, idiom handling):
+INPUT: "It's about time we addressed it. Workers have been mixing cement by hand for decades, but the result is cracked joints and toxic dust."
+CORRECT (Combined fluff, contextualized 2-word keywords):
+  seg_1: "It's about time we addressed it. Workers have been mixing cement by hand for decades," → "mixing plaster"
   seg_2: "but the result is cracked joints" → "cracked drywall"
   seg_3: "and toxic dust." → "construction dust"
+
+EXAMPLE 3 (Fitness Theme, idiom handling):
+INPUT: "Don't throw in the towel if you miss a day. Consistency is the name of the game when building muscle."
+CORRECT (Ignored idioms, contextualized):
+  seg_1: "Don't throw in the towel if you miss a day." → "exhausted athlete"
+  seg_2: "Consistency is the name of the game when building muscle." → "weightlifting exercise"
+WRONG (Literal/ambiguous):
+  seg_1: "Don't throw in the towel if you miss a day." → "gym towel" (WRONG! Figurative!)
+  seg_2: "Consistency is the name of the game when building muscle." → "playing game" (WRONG! Figurative!)
 
 === THEME ===
 Identify ONE primary theme concept (1-3 words max) that is the absolute core material/subject of the video (e.g., "drywall", "concrete").
@@ -308,35 +340,56 @@ Script:
 """
     
     models_to_try = [
-        "openai/gpt-oss-120b",
-        "nvidia/nemotron-3-super-120b-a12b",
-        "meta/llama-3.1-70b-instruct"
+        {"provider": "nvidia", "model": "openai/gpt-oss-120b"},
+        {"provider": "openrouter", "model": "openai/gpt-oss-120b:free"},
+        {"provider": "nvidia", "model": "meta/llama-3.3-70b-instruct"},
+        {"provider": "nvidia", "model": "meta/llama-3.1-70b-instruct"},
+        {"provider": "nvidia", "model": "nvidia/nemotron-3-super-120b-a12b"},
+        {"provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
+        {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}
     ]
     
-    for attempt in range(3):
+    for attempt_idx, attempt_cfg in enumerate(models_to_try):
         try:
-            model_to_use = models_to_try[attempt]
-            print(f"   Calling NIM API with model: {model_to_use}...")
-            response = nim_client.chat.completions.create(
+            provider = attempt_cfg["provider"]
+            model_to_use = attempt_cfg["model"]
+            client_to_use = get_llm_client(provider)
+            
+            if not client_to_use:
+                continue
+                
+            print(f"   Calling {provider.upper()} API with model: {model_to_use}...")
+            response = client_to_use.chat.completions.create(
                 model=model_to_use,
                 messages=[{"role": "user", "content": segment_prompt}],
-                max_tokens=2048,
-                temperature=0.2
+                max_tokens=4096,
+                temperature=0.2,
+                timeout=90.0
             )
             
             raw_content = response.choices[0].message.content
-            if raw_content is None:
-                raise ValueError(f"API returned None for content with model {model_to_use}.")
+            if not raw_content:
+                # Reasoning models (e.g. gpt-oss-120b) put output in reasoning_content
+                raw_content = getattr(response.choices[0].message, 'reasoning_content', None)
+            if not raw_content:
+                raise ValueError(f"API returned no content from model {model_to_use}.")
             
             content = raw_content.strip()
             
             # Try to parse JSON. Sometimes LLMs wrap in ```json
-            if content.startswith("```json"):
-                content = content[7:-3]
-            elif content.startswith("```"):
-                content = content[3:-3]
-                
-            data = json.loads(content)
+            import re
+            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+            if json_match:
+                extracted = json_match.group(1)
+            else:
+                start_idx = content.find('{')
+                end_idx = content.rfind('}')
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    extracted = content[start_idx:end_idx+1]
+                else:
+                    extracted = content
+                    
+            data = json.loads(extracted)
             segments = data.get("segments", [])
             theme_word = data.get("theme_word", "Concept")
             theme_hex_color = data.get("theme_hex_color", "00FFFF")
@@ -358,7 +411,18 @@ Script:
                     # Truncate to first 2 words
                     seg["envato_search_query"] = " ".join(words[:2])
                     print(f"   ⚠️  Truncated query '{query}' → '{seg['envato_search_query']}'")
-            
+            # Deduplicate: remove segments with repeated voiceover_text (LLM looping)
+            seen_voiceovers = set()
+            deduped_segments = []
+            for seg in segments:
+                vt = seg.get("voiceover_text", "").strip().lower()
+                if vt not in seen_voiceovers:
+                    seen_voiceovers.add(vt)
+                    deduped_segments.append(seg)
+                else:
+                    print(f"   ⚠️  Removed duplicate segment: '{seg.get('voiceover_text', '')[:50]}'")
+            segments = deduped_segments
+
             print(f"   ✅ LLM returned {len(segments)} segments (minimum target was {min_segments})")
                 
             # Deterministic Validation: Ensure theme_word is exactly in the script
@@ -387,8 +451,8 @@ Script:
                 
             return segments, theme_word, theme_hex_color, script_hash, dynamic_subthemes
         except Exception as e:
-            print(f"Attempt {attempt+1} failed to parse JSON. Retrying...")
-            if attempt == 2:
+            print(f"Attempt {attempt_idx+1} failed to parse JSON via {model_to_use}. Error: {e}. Retrying...")
+            if attempt_idx == len(models_to_try) - 1:
                 print("Final attempt failed. Raw output:")
                 try:
                     print(raw_content)
@@ -1028,6 +1092,19 @@ def rank_video_results(voiceover, links):
     if len(links) <= 1:
         return links
         
+    # If Envato hid the titles (meaning they are all Unknown Title or stock-video.item.alt)
+    # then ranking is pointless. Just return the original order.
+    has_valid_titles = False
+    for link in links:
+        t = link.get('title', '').strip().lower()
+        if t and t != "unknown title" and t != "stock-video.item.alt":
+            has_valid_titles = True
+            break
+            
+    if not has_valid_titles:
+        print("   ⚠️  No valid video titles available on Envato search page. Bypassing LLM ranking.")
+        return links
+        
     prompt = f"""You are an expert video editor. I have a voiceover segment: "{voiceover}"
 I searched for B-roll and found the following videos:
 """
@@ -1039,33 +1116,54 @@ Rank these videos from most relevant to least relevant to the voiceover.
 Consider that some titles might be ambiguous or completely unrelated (e.g. medical vs construction).
 Output ONLY a comma-separated list of the numbers representing your ranking (e.g., '2, 1, 3' or '3, 2, 1').
 """
-    try:
-        response = nim_client.chat.completions.create(
-            model="meta/llama-3.1-70b-instruct",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=20,
-            temperature=0.1
-        )
-        content = response.choices[0].message.content.strip()
-        print(f"   [LLM Ranking] Assessing titles against voiceover: '{voiceover}'")
-        for i, link in enumerate(links):
-            print(f"      {i+1}. {link['title']}")
-        print(f"   [LLM Ranking] Chosen Order: {content}")
-        
-        import re
-        indices = [int(idx) for idx in re.findall(r'\d+', content)]
-        valid_indices = [idx - 1 for idx in indices if 1 <= idx <= len(links)]
-        
-        # Add any missing indices
-        for i in range(len(links)):
-            if i not in valid_indices:
-                valid_indices.append(i)
+    models_to_try = [
+        {"provider": "nvidia", "model": "openai/gpt-oss-120b"},
+        {"provider": "openrouter", "model": "openai/gpt-oss-120b:free"},
+        {"provider": "nvidia", "model": "meta/llama-3.3-70b-instruct"},
+        {"provider": "nvidia", "model": "meta/llama-3.1-70b-instruct"},
+        {"provider": "nvidia", "model": "nvidia/nemotron-3-super-120b-a12b"},
+        {"provider": "openrouter", "model": "google/gemma-4-31b-it:free"},
+        {"provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free"}
+    ]
+    
+    for attempt_cfg in models_to_try:
+        try:
+            provider = attempt_cfg["provider"]
+            model_to_use = attempt_cfg["model"]
+            client_to_use = get_llm_client(provider)
+            
+            if not client_to_use:
+                continue
                 
-        ranked_links = [links[i] for i in valid_indices[:len(links)]]
-        return ranked_links
-    except Exception as e:
-        print(f"   ⚠️  Failed to rank videos via LLM: {e}. Falling back to default order.")
-        return links
+            response = client_to_use.chat.completions.create(
+                model=model_to_use,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=512,
+                temperature=0.1,
+                timeout=30.0
+            )
+            content = response.choices[0].message.content.strip()
+            print(f"   [LLM Ranking ({provider.upper()}: {model_to_use})] Assessing titles against voiceover: '{voiceover}'")
+            for i, link in enumerate(links):
+                print(f"      {i+1}. {link['title']}")
+            print(f"   [LLM Ranking] Chosen Order: {content}")
+            
+            import re
+            indices = [int(idx) for idx in re.findall(r'\d+', content)]
+            valid_indices = [idx - 1 for idx in indices if 1 <= idx <= len(links)]
+            
+            # Add any missing indices
+            for i in range(len(links)):
+                if i not in valid_indices:
+                    valid_indices.append(i)
+                    
+            ranked_links = [links[i] for i in valid_indices[:len(links)]]
+            return ranked_links
+        except Exception as e:
+            print(f"   ⚠️  Failed to rank videos via {model}: {e}.")
+            
+    print("   ⚠️  All models failed to rank videos. Falling back to default order.")
+    return links
 
 def main():
     if not NVIDIA_NIM_API_KEY:
@@ -1132,6 +1230,7 @@ def main():
     print("\n=== PHASE 1: ENVATO VIDEO DOWNLOADS ===")
     videos_to_download = []
     video_paths = {}
+    global_used_urls = set()
     valid_exts = (".mp4", ".mov", ".webm", ".mkv", ".avi")
     
     for seg in segments:
@@ -1180,11 +1279,10 @@ def main():
     if videos_to_download:
         with EnvatoElementsDownloader(download_dir=BASE_DOWNLOAD_DIR, media_type="video", headless=False) as downloader:
             downloader.ensure_logged_in()
-            unauthorized_attempts = 0
-            
             failed_downloads = videos_to_download.copy()
             max_retries = 3
             current_retry = 0
+            unauthorized_attempts = 0
             
             while failed_downloads and current_retry <= max_retries:
                 if current_retry > 0:
@@ -1193,109 +1291,116 @@ def main():
                 retry_queue = failed_downloads.copy()
                 failed_downloads.clear()
                 
-                i = 0
-                while i < len(retry_queue):
-                    seg = retry_queue[i]
-                    seg_id = seg["segment_id"]
-                    query = seg["envato_search_query"]
-                    print(f"\n[{i+1}/{len(retry_queue)}] Searching for {seg_id}: {query}")
-                    
-                    seg_dir = BASE_DOWNLOAD_DIR / script_hash / seg_id
-                    downloader.download_dir = seg_dir
-                    
-                    links = downloader.search_and_get_links(query, 3)
-                    
-                    if links:
-                        links = rank_video_results(seg.get("voiceover_text", query), links)
+                queue = [{"seg": seg, "link_idx": 0, "links": []} for seg in retry_queue]
+                active_downloads = []
+                max_concurrent = 5
+                
+                while queue or active_downloads:
+                    # 1. Fill the window
+                    while len(active_downloads) < max_concurrent and queue:
+                        item = queue.pop(0)
+                        seg = item["seg"]
+                        link_idx = item["link_idx"]
+                        seg_id = seg["segment_id"]
+                        query = seg["envato_search_query"]
                         
+                        if not item["links"]:
+                            print(f"\nSearching for {seg_id}: {query}")
+                            links = downloader.search_and_get_links(query, 5)
+                            if links:
+                                filtered_links = [l for l in links if l["url"] not in global_used_urls]
+                                if not filtered_links:
+                                    print("   ⚠️  All top search results have already been used by previous segments. Falling back to unfiltered list.")
+                                    filtered_links = links
+                                item["links"] = rank_video_results(seg.get("voiceover_text", query), filtered_links)
+                                
+                        links = item["links"]
+                        
+                        if links and link_idx < len(links):
+                            seg_dir = BASE_DOWNLOAD_DIR / script_hash / seg_id
+                            cache_dir = seg_dir / "temp_cache"
+                            cache_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            downloader.download_dir = cache_dir
+                            link_obj = links[link_idx]
+                            
+                            res = downloader.trigger_download(link_idx + 1, link_obj["url"])
+                            if res == "UNAUTHORIZED":
+                                queue.clear()
+                                active_downloads.clear()
+                                failed_downloads.extend([q["seg"] for q in queue] + [a["queue_item"]["seg"] for a in active_downloads] + [item["seg"]])
+                                unauthorized_attempts += 1
+                                if unauthorized_attempts == 1:
+                                    print("\n" + "!" * 60 + "\n [Recovery Mode 1] Log in to Envato. Will auto-retry in 5 mins.\n" + "!" * 60)
+                                    timed_input("Press Enter to retry now... ", 300)
+                                elif unauthorized_attempts == 2:
+                                    print("\n" + "!" * 60 + "\n [Recovery Mode 2] Log in to Envato. Will auto-retry in 5 mins.\n" + "!" * 60)
+                                    timed_input("Press Enter to retry now... ", 300)
+                                else:
+                                    print("\n" + "!" * 60 + "\n [Manual Override] Log in to Envato. Press Enter when done.\n" + "!" * 60)
+                                    input("Press Enter to continue... ")
+                                break
+                            elif res:
+                                global_used_urls.add(link_obj["url"])
+                                active_downloads.append({
+                                    "queue_item": item,
+                                    "download_info": res,
+                                    "seg_dir": seg_dir,
+                                    "cache_dir": cache_dir
+                                })
+                            else:
+                                item["link_idx"] += 1
+                                queue.insert(0, item)
+                        else:
+                            print(f"❌ Download failed for all links for {seg_id}. Adding to retry queue.")
+                            if seg not in failed_downloads:
+                                failed_downloads.append(seg)
+                                
+                    if not active_downloads:
+                        continue
+                        
+                    # 2. Process oldest active
+                    active = active_downloads.pop(0)
+                    dl_info = active["download_info"]
+                    q_item = active["queue_item"]
+                    cache_dir = active["cache_dir"]
+                    seg_dir = active["seg_dir"]
+                    link_idx = q_item["link_idx"]
+                    seg_id = q_item["seg"]["segment_id"]
+                    
                     success = False
                     
-                    if links:
-                        # Create cache dir once before the link loop so cached files accumulate
-                        cache_dir = seg_dir / "temp_cache"
-                        if cache_dir.exists():
-                            shutil.rmtree(str(cache_dir), ignore_errors=True)
-                        cache_dir.mkdir(parents=True, exist_ok=True)
+                    save_res = downloader.wait_and_save_download(dl_info["download_obj"], dl_info["filepath"])
+                    if save_res:
+                        downloaded_zips = [f for f in os.listdir(cache_dir) if f.lower().endswith('.zip')]
+                        for zf in downloaded_zips:
+                            try:
+                                import zipfile
+                                with zipfile.ZipFile(cache_dir / zf, 'r') as z: z.extractall(cache_dir)
+                                os.remove(cache_dir / zf)
+                            except: pass
                         
-                        for link_idx, link_obj in enumerate(links):
-                            print(f"   → Trying search result {link_idx + 1}/{len(links)}...")
-                            downloader.download_dir = cache_dir
-                            download_success = downloader.download_item(link_idx + 1, link_obj["url"])
-                            
-                            if download_success == "UNAUTHORIZED":
-                                success = "UNAUTHORIZED"
-                                break
-                            elif download_success:
-                                # Handle zip
-                                downloaded_zips = [f for f in os.listdir(cache_dir) if f.lower().endswith('.zip')]
-                                for zf in downloaded_zips:
-                                    try:
-                                        with zipfile.ZipFile(cache_dir / zf, 'r') as z: z.extractall(cache_dir)
-                                        os.remove(cache_dir / zf)
-                                    except: pass
-                                
-                                files = [f for f in os.listdir(cache_dir) if f.lower().endswith(valid_exts) and not f.startswith('cached_')]
-                                if files:
-                                    candidate = cache_dir / files[0]
-                                    if is_video_mostly_black(str(candidate)) or is_video_horizontal(str(candidate)):
-                                        os.remove(candidate)
-                                    else:
-                                        has_motion, freeze_frac = has_high_motion(str(candidate))
-                                        # Rename with index prefix so fallback prefers first-downloaded
-                                        cache_name = f"cached_{link_idx}_{freeze_frac:.4f}_{candidate.name}"
-                                        os.rename(str(candidate), str(cache_dir / cache_name))
-                                        if has_motion:
-                                            shutil.move(str(cache_dir / cache_name), str(seg_dir / candidate.name))
-                                            shutil.rmtree(str(cache_dir), ignore_errors=True)
-                                            video_paths[seg_id] = str(seg_dir / candidate.name)
-                                            success = True
-                                            break
-                                            
-                        if success == "UNAUTHORIZED":
-                            unauthorized_attempts += 1
-                            if unauthorized_attempts == 1:
-                                print("\n" + "!" * 60 + "\n [Recovery Mode 1] Log in to Envato. Will auto-retry in 5 mins.\n" + "!" * 60)
-                                timed_input("Press Enter to retry now... ", 300)
-                            elif unauthorized_attempts == 2:
-                                print("\n" + "!" * 60 + "\n [Recovery Mode 2] Log in to Envato. Will auto-retry in 5 mins.\n" + "!" * 60)
-                                timed_input("Press Enter to retry now... ", 300)
+                        files = [f for f in os.listdir(cache_dir) if f.lower().endswith(valid_exts) and not f.startswith('cached_')]
+                        if files:
+                            candidate = cache_dir / files[0]
+                            if is_video_mostly_black(str(candidate)) or is_video_horizontal(str(candidate)):
+                                os.remove(candidate)
                             else:
-                                print("\n" + "!" * 60 + "\n [Final Recovery] Please log in. I will wait indefinitely.\n" + "!" * 60)
-                                input("Press Enter to retry... ")
-                            continue
-                            
-                        if not success:
-                            cache_dir = seg_dir / "temp_cache"
-                            if cache_dir.exists():
-                                cached_files = [f for f in os.listdir(cache_dir) if f.startswith("cached_")]
-                                if cached_files:
-                                    # Sort by (freeze_fraction ASC, index ASC) to prefer most motion, then earliest downloaded
-                                    # Format: cached_{index}_{freeze_frac}_{original_name}
-                                    cached_files.sort(key=lambda x: (float(x.split('_')[2]), int(x.split('_')[1])))
-                                    best_fallback = cached_files[0]
-                                    parts = best_fallback.split('_', 3)  # ['cached', index, freeze_frac, original_name]
-                                    freeze_frac = float(parts[2])
-                                    original_name = parts[3]
-                                    shutil.move(str(cache_dir / best_fallback), str(seg_dir / original_name))
-                                    print(f"   ⚠️  All links had low motion. Falling back to best ({freeze_frac:.0%} frozen): {original_name}")
-                                    video_paths[seg_id] = str(seg_dir / original_name)
+                                has_motion, freeze_frac = has_high_motion(str(candidate))
+                                cache_name = f"cached_{link_idx}_{freeze_frac:.4f}_{candidate.name}"
+                                os.rename(str(candidate), str(cache_dir / cache_name))
+                                if has_motion:
+                                    shutil.move(str(cache_dir / cache_name), str(seg_dir / candidate.name))
+                                    shutil.rmtree(str(cache_dir), ignore_errors=True)
+                                    video_paths[seg_id] = str(seg_dir / candidate.name)
                                     success = True
-                                shutil.rmtree(str(cache_dir), ignore_errors=True)
-                            
-                    if not success:
-                        print(f"   ❌ Download failed for all links for {seg_id}. Adding to retry queue.")
-                        failed_downloads.append(seg)
-                        
-                    unauthorized_attempts = 0
-                    i += 1
-                    human_delay(3, 5)
                     
+                    if not success:
+                        q_item["link_idx"] += 1
+                        queue.insert(0, q_item)
+
                 current_retry += 1
-                
-            if failed_downloads:
-                print(f"\n❌ ERROR: Failed to download {len(failed_downloads)} segments after {max_retries} retries.")
-                sys.exit(1)
-            
+
     # Check if all videos are present
     missing_videos = [s for s in segments if s["segment_id"] not in video_paths]
     if missing_videos:
